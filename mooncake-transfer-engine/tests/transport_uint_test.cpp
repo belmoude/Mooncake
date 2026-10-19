@@ -101,6 +101,12 @@ class TransferEngineImplTestPeer {
         return *engine.impl_;
     }
 
+    static RdmaRegistrationPolicy registrationPolicy(TransferEngine& engine,
+                                                     void* addr) {
+        return engine.impl_->local_memory_regions_.at((uintptr_t)addr)
+            .rdma_registration_policy;
+    }
+
     static AutoDiscoverConfig autoDiscoverConfig(
         const TransferEngineImpl& engine) {
         return engine.auto_discover_config_;
@@ -1359,6 +1365,32 @@ TEST_F(TransportTest, ReadEmptyFile) {
     EXPECT_EQ(bytesRead, static_cast<ssize_t>(0));
 
     close(fd);
+}
+
+TEST_F(TransportTest, RdmaOverridesKeepOtherTransportsOnExistingVirtualApi) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    if (engine.isUsingTent()) GTEST_SKIP() << "Classic transport dispatch test";
+    auto transport = std::make_shared<BatchResultTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl, transport);
+    std::array<char, 128> buffer{};
+    const auto local = RdmaRegistrationPolicy::TopologyLocal;
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), local),
+              0);
+    EXPECT_EQ(
+        TransferEngineImplTestPeer::registrationPolicy(engine, buffer.data()),
+        local);
+    ASSERT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+    ASSERT_EQ(engine.registerLocalMemoryBatch({{buffer.data(), buffer.size()}},
+                                              local),
+              0);
+    EXPECT_EQ(transport->registeredBufferCount(), 1);
+    EXPECT_EQ(
+        TransferEngineImplTestPeer::registrationPolicy(engine, buffer.data()),
+        local);
+    ASSERT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), 0);
+    EXPECT_EQ(transport->registeredBufferCount(), 0);
 }
 
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {

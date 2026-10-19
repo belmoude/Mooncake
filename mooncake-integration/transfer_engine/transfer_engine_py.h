@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <stack>
 #include <vector>
 
@@ -293,12 +294,22 @@ class TransferEnginePy {
                        const std::string &location = kWildcardLocation,
                        bool remote_accessible = true);
 
+    int registerMemoryWithRdmaPolicy(
+        uintptr_t buffer_addr, size_t capacity, const std::string &location,
+        bool remote_accessible,
+        const std::optional<std::string> &rdma_registration_policy);
+
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
     int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
                             std::vector<size_t> capacities,
                             const std::string &location = kWildcardLocation);
+
+    int batchRegisterMemoryWithRdmaPolicy(
+        std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
+        const std::string &location,
+        const std::optional<std::string> &rdma_registration_policy);
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 

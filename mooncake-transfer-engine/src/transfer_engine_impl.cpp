@@ -30,6 +30,7 @@
 #include "transfer_metadata_plugin.h"
 #include "common.h"
 #include "transport/transport.h"
+#include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
 #ifdef USE_BAREX
@@ -39,6 +40,28 @@
 namespace mooncake {
 
 namespace {
+// Only RDMA consumes the policy. Other transports retain their virtual API.
+int registerTransportMemory(Transport* transport, void* addr, size_t length,
+                            RdmaRegistrationPolicy policy,
+                            const std::string& location, bool remote_accessible,
+                            bool update_metadata) {
+    if (auto* rdma = dynamic_cast<RdmaTransport*>(transport)) {
+        return rdma->registerLocalMemory(addr, length, policy, location,
+                                         remote_accessible, update_metadata);
+    }
+    return transport->registerLocalMemory(addr, length, location,
+                                          remote_accessible, update_metadata);
+}
+
+int registerTransportMemoryBatch(Transport* transport,
+                                 const std::vector<BufferEntry>& buffers,
+                                 RdmaRegistrationPolicy policy,
+                                 const std::string& location) {
+    if (auto* rdma = dynamic_cast<RdmaTransport*>(transport))
+        return rdma->registerLocalMemoryBatch(buffers, policy, location);
+    return transport->registerLocalMemoryBatch(buffers, location);
+}
+
 bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
                        uint64_t region_length) {
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
@@ -107,8 +130,7 @@ static std::string loadTopologyJsonFile(const std::string& path) {
 
 int TransferEngineImpl::setRdmaRegistrationPolicy(
     RdmaRegistrationPolicy policy) {
-    if (init_started_ || (policy != RdmaRegistrationPolicy::All &&
-                          policy != RdmaRegistrationPolicy::TopologyLocal)) {
+    if (init_started_ || !isValidRdmaRegistrationPolicy(policy)) {
         return ERR_INVALID_ARGUMENT;
     }
     rdma_registration_policy_ = policy;
@@ -595,12 +617,18 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
     // shared lock here. If future modifications allow installTransport() to be
     // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
     // added to ensure thread safety.
-    for (auto& [_, entry] : local_memory_regions_) {
-        int ret = transport->registerLocalMemory(
-            entry.addr, entry.length, entry.location, entry.remote_accessible);
-        if (ret < 0) return nullptr;
-    }
+    if (replayLocalMemory(transport) < 0) return nullptr;
     return transport;
+}
+
+int TransferEngineImpl::replayLocalMemory(Transport* transport) {
+    for (const auto& [_, entry] : local_memory_regions_) {
+        int ret = registerTransportMemory(
+            transport, entry.addr, entry.length, entry.rdma_registration_policy,
+            entry.location, entry.remote_accessible, true);
+        if (ret < 0) return ret;
+    }
+    return 0;
 }
 
 int TransferEngineImpl::uninstallTransport(const std::string& proto) {
@@ -793,6 +821,16 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
                                             const std::string& location,
                                             bool remote_accessible,
                                             bool update_metadata) {
+    return registerLocalMemory(addr, length, rdma_registration_policy_,
+                               location, remote_accessible, update_metadata);
+}
+
+int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
+                                            RdmaRegistrationPolicy policy,
+                                            const std::string& location,
+                                            bool remote_accessible,
+                                            bool update_metadata) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
     if (length == 0) {
         LOG(ERROR)
             << "Transfer Engine does not support zero length memory region";
@@ -800,7 +838,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
 
     std::vector<MemoryRegion> regions = {
-        {addr, length, location, remote_accessible}};
+        {addr, length, location, remote_accessible, policy}};
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
@@ -810,8 +848,9 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     std::vector<Transport*> attempted_transports;
     for (auto transport : multi_transports_->listTransports()) {
         attempted_transports.push_back(transport);
-        int ret = transport->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata);
+        int ret =
+            registerTransportMemory(transport, addr, length, policy, location,
+                                    remote_accessible, update_metadata);
         if (ret < 0) {
             // Roll back the transports that already registered so a partial
             // failure doesn't leave the region registered on some of them.
@@ -858,6 +897,13 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
 int TransferEngineImpl::mp_registerLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
+    return mp_registerLocalMemory(buffer_map, rdma_registration_policy_);
+}
+
+int TransferEngineImpl::mp_registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>& buffer_map,
+    RdmaRegistrationPolicy policy) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
     // ========== Phase 1: Pre-check ==========
     for (const auto& entry : buffer_map) {
         for (const auto& buffer : entry.second) {
@@ -897,8 +943,8 @@ int TransferEngineImpl::mp_registerLocalMemory(
         }
 
         for (const auto& buffer : buffer_list) {
-            int ret = transport->registerLocalMemory(
-                buffer.addr, buffer.length, buffer.location,
+            int ret = registerTransportMemory(
+                transport, buffer.addr, buffer.length, policy, buffer.location,
                 buffer.remote_accessible, buffer.update_metadata);
 
             if (ret < 0) {
@@ -914,7 +960,7 @@ int TransferEngineImpl::mp_registerLocalMemory(
             // Record successful registration for potential rollback
             success_records.push_back(TransferEngineImpl::RegisteredRecord{
                 transport, buffer.addr, buffer.length, buffer.location,
-                buffer.remote_accessible});
+                buffer.remote_accessible, policy});
         }
     }
 
@@ -923,8 +969,8 @@ int TransferEngineImpl::mp_registerLocalMemory(
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& record : success_records) {
             insertMemoryRegionLocked({record.addr, record.length,
-                                      record.location,
-                                      record.remote_accessible});
+                                      record.location, record.remote_accessible,
+                                      record.rdma_registration_policy});
         }
     }
 
@@ -974,6 +1020,14 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
+    return registerLocalMemoryBatch(buffer_list, rdma_registration_policy_,
+                                    location);
+}
+
+int TransferEngineImpl::registerLocalMemoryBatch(
+    const std::vector<BufferEntry>& buffer_list, RdmaRegistrationPolicy policy,
+    const std::string& location) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
     std::vector<BufferEntry> sorted_buffers = buffer_list;
     std::sort(sorted_buffers.begin(), sorted_buffers.end(),
               [](const BufferEntry& lhs, const BufferEntry& rhs) {
@@ -1006,7 +1060,7 @@ int TransferEngineImpl::registerLocalMemoryBatch(
     regions.reserve(buffer_list.size());
     addr_list.reserve(buffer_list.size());
     for (const auto& buffer : buffer_list) {
-        regions.push_back({buffer.addr, buffer.length, location, true});
+        regions.push_back({buffer.addr, buffer.length, location, true, policy});
         addr_list.push_back(buffer.addr);
     }
     if (!tryReserveMemoryRegions(regions)) {
@@ -1018,7 +1072,8 @@ int TransferEngineImpl::registerLocalMemoryBatch(
     std::vector<Transport*> attempted_transports;
     for (auto transport : multi_transports_->listTransports()) {
         attempted_transports.push_back(transport);
-        int ret = transport->registerLocalMemoryBatch(buffer_list, location);
+        int ret = registerTransportMemoryBatch(transport, buffer_list, policy,
+                                               location);
         if (ret) {
             for (auto it = attempted_transports.rbegin();
                  it != attempted_transports.rend(); ++it) {
