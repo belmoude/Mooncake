@@ -291,9 +291,18 @@ int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
                                  const char* device_name) {
+    return initializeWithRdmaPolicy(local_hostname, metadata_server, protocol,
+                                    device_name, "all");
+}
+
+int TransferEnginePy::initializeWithRdmaPolicy(
+    const char* local_hostname, const char* metadata_server,
+    const char* protocol, const char* device_name,
+    const std::string& rdma_registration_policy) {
     auto conn_string = parseConnectionString(metadata_server);
-    return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
-                         device_name, conn_string.first.c_str());
+    return initializeExtWithRdmaPolicy(
+        local_hostname, conn_string.second.c_str(), protocol, device_name,
+        conn_string.first.c_str(), rdma_registration_policy);
 }
 
 int TransferEnginePy::initializeExt(const char* local_hostname,
@@ -301,6 +310,25 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
+    return initializeExtWithRdmaPolicy(local_hostname, metadata_server,
+                                       protocol, device_name, metadata_type,
+                                       "all");
+}
+
+int TransferEnginePy::initializeExtWithRdmaPolicy(
+    const char* local_hostname, const char* metadata_server,
+    const char* protocol, const char* device_name, const char* metadata_type,
+    const std::string& rdma_registration_policy) {
+    RdmaRegistrationPolicy policy;
+    if (rdma_registration_policy == "all")
+        policy = RdmaRegistrationPolicy::All;
+    else if (rdma_registration_policy == "local")
+        policy = RdmaRegistrationPolicy::TopologyLocal;
+    else {
+        LOG(ERROR) << "Invalid rdma_registration_policy: "
+                   << rdma_registration_policy << "; expected all or local";
+        return ERR_INVALID_ARGUMENT;
+    }
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
@@ -342,6 +370,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 #else
     engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
+
+    int policy_ret = engine_->setRdmaRegistrationPolicy(policy);
+    if (policy_ret) return policy_ret;
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
@@ -1800,8 +1831,16 @@ PYBIND11_MODULE(engine, m) {
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
-            .def("initialize", &TransferEnginePy::initialize)
-            .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("initialize", &TransferEnginePy::initializeWithRdmaPolicy,
+                 py::arg("local_hostname"), py::arg("metadata_server"),
+                 py::arg("protocol"), py::arg("device_name"), py::kw_only(),
+                 py::arg("rdma_registration_policy") = "all")
+            .def("initialize_ext",
+                 &TransferEnginePy::initializeExtWithRdmaPolicy,
+                 py::arg("local_hostname"), py::arg("metadata_server"),
+                 py::arg("protocol"), py::arg("device_name"),
+                 py::arg("metadata_type"), py::kw_only(),
+                 py::arg("rdma_registration_policy") = "all")
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)

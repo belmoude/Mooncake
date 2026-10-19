@@ -70,6 +70,50 @@ HCA, including cached selections, hints and retries. Some contexts may have no
 MR for a buffer, for example due to Data Direct pairing. Registration fails and
 rolls back if any chunk has no MR satisfying the requested access permissions.
 
+### GPU Memory Registration Policy
+
+Classic Transfer Engine supports an instance-level RDMA registration policy.
+The default, `RdmaRegistrationPolicy::All`, retains the existing registration
+behavior. Set `TopologyLocal` before `init()` to register GPU device memory on
+the active preferred HCAs for that buffer's topology location:
+
+```cpp
+TransferEngine engine(true);
+int rc = engine.setRdmaRegistrationPolicy(
+    RdmaRegistrationPolicy::TopologyLocal);
+if (rc != 0) return rc;
+rc = engine.init(metadata, server_name);
+if (rc != 0) return rc;
+rc = engine.registerLocalMemory(gpu_addr, length);
+```
+
+Python accepts an optional keyword on initialization:
+
+```python
+engine.initialize(host, "P2PHANDSHAKE", "rdma", device_name,
+                  rdma_registration_policy="local")
+engine.register_memory(gpu_addr, length)
+```
+
+`initialize_ext` accepts the same keyword; its default is `"all"`.
+The setting applies to both `rdma` and `rdma_twosided`. Classic Engine freezes
+the default when initialization starts, including a failed initialization.
+Create another Engine to use another default. TENT rejects `TopologyLocal`;
+setting `All` is a no-op in TENT.
+
+CPU, pinned host, managed and unclassified memory retain the existing full
+registration path. Without active preferred HCAs or a matching location,
+device memory also uses that path. Registration failure on a selected HCA
+returns an error and rolls back; it does not trigger another registration set.
+Runtime failover uses only existing valid MR keys and never adds registrations.
+Full registration continues to respect device filtering and Data Direct rules.
+
+Enable `TopologyLocal` only when every RDMA peer accessing these buffers has
+the sparse-key selection checks. The metadata format is unchanged, but older
+readers may select an unregistered HCA. Selective registration reduces the
+available failover paths; measure registration cost and transfer performance
+on the intended GPU/NIC topology before deployment.
+
 ### Endpoint Management
 Mooncake Store employs a pair of endpoints to represent the connection between a local RDMA
 NIC and a remote RDMA NIC. In practice, each endpoint

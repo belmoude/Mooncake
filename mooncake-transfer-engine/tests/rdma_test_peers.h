@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 
+#include "memory_location.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -47,6 +48,23 @@ class RdmaTransportTestPeer {
     static void bindTopology(RdmaTransport &transport,
                              std::shared_ptr<Topology> topology) {
         transport.local_topology_ = std::move(topology);
+    }
+
+    static void setRegistrationPolicy(RdmaTransport &transport,
+                                      RdmaRegistrationPolicy policy) {
+        transport.default_registration_policy_ = policy;
+    }
+
+    static void initializePreferredDevices(RdmaTransport &transport) {
+        transport.initializePreferredDevices();
+    }
+
+    static int registerWithPolicy(RdmaTransport &transport, void *addr,
+                                  size_t length, RdmaRegistrationPolicy policy,
+                                  bool remote_accessible = true) {
+        return transport.registerLocalMemoryInternal(
+            addr, length, kWildcardLocation, remote_accessible, false, false,
+            policy);
     }
 
     static int selectLocalDevice(RdmaTransport &transport,

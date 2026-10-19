@@ -105,10 +105,21 @@ static std::string loadTopologyJsonFile(const std::string& path) {
     return content;
 }
 
+int TransferEngineImpl::setRdmaRegistrationPolicy(
+    RdmaRegistrationPolicy policy) {
+    if (init_started_ || (policy != RdmaRegistrationPolicy::All &&
+                          policy != RdmaRegistrationPolicy::TopologyLocal)) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    rdma_registration_policy_ = policy;
+    return 0;
+}
+
 int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
                              uint64_t rpc_port) {
+    init_started_ = true;
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
@@ -376,7 +387,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                  !getenv("MC_FORCE_TCP")) ||
                 getenv("MC_FORCE_HCA")) {
                 Transport* t = multi_transports_->installTransport(
-                    "rdma", local_topology_);
+                    "rdma", local_topology_, rdma_registration_policy_);
                 if (!t) {
                     LOG(ERROR) << "Failed to install RDMA transport for MACA";
                     return -1;
@@ -451,8 +462,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                    (force_gpu_p2p || (no_hca && !force_hca))) {
             // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
             // explicitly requested GPU P2P transport precedence unchanged.
-            Transport* t =
-                multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
+            Transport* t = multi_transports_->installTransport(
+                gpu_p2p_protocol, nullptr, rdma_registration_policy_);
             if (!t) {
                 LOG(ERROR) << "Failed to install " << gpu_p2p_name
                            << " transport";
@@ -461,8 +472,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using " << gpu_p2p_name << " transport "
                       << "(forced or no HCA detected)";
         } else if (!no_hca || force_hca) {
-            Transport* t =
-                multi_transports_->installTransport("rdma", local_topology_);
+            Transport* t = multi_transports_->installTransport(
+                "rdma", local_topology_, rdma_registration_policy_);
             if (!t) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
@@ -502,7 +513,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
             } else {
                 transport = multi_transports_->installTransport(
-                    transport_type, local_topology_);
+                    transport_type, local_topology_, rdma_registration_policy_);
             }
             if (transport == nullptr) {
                 LOG(ERROR) << "Failed to install transport, type="
@@ -575,7 +586,8 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
         }
     }
 
-    transport = multi_transports_->installTransport(proto, local_topology_);
+    transport = multi_transports_->installTransport(proto, local_topology_,
+                                                    rdma_registration_policy_);
     if (!transport) return nullptr;
 
     // Since installTransport() is only called once during initialization

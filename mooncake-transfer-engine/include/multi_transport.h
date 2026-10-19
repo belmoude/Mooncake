@@ -82,6 +82,9 @@ class MultiTransport {
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
+    Transport *installTransport(const std::string &proto,
+                                std::shared_ptr<Topology> topo,
+                                RdmaRegistrationPolicy policy);
 
     Transport *getTransport(const std::string &proto);
 
