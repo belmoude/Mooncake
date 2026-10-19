@@ -496,6 +496,17 @@ target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
+# Run production registration/chunk/selector code with verbs and NUMA stubs. Use
+# a static library so the test supplies the verbs registration symbols.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  add_executable(rdma_registration_policy_test
+                 ${WORKSPACE}/rdma_registration_policy_test.cpp)
+  target_link_libraries(rdma_registration_policy_test PUBLIC transfer_engine
+                                                             gtest gtest_main)
+  add_test(NAME rdma_registration_policy_test
+           COMMAND rdma_registration_policy_test)
+endif()
+
 add_executable(rdma_memory_location_test
                ${WORKSPACE}/rdma_memory_location_test.cpp)
 target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest

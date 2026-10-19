@@ -49,6 +49,16 @@ class RdmaTransportTestPeer {
         transport.local_topology_ = std::move(topology);
     }
 
+    static int selectLocalDevice(RdmaTransport &transport,
+                                 RdmaTransport::SegmentDesc *desc,
+                                 uint64_t addr, size_t length, int &buffer_id,
+                                 int &device_id, int hint_buffer = -1,
+                                 int hint_device = -1) {
+        return transport.selectLocalDevice(desc, addr, length, {}, buffer_id,
+                                           device_id, 0, hint_buffer,
+                                           hint_device);
+    }
+
     // Drives the device-initialization loop directly so tests can assert on
     // the resulting context_list_ layout without a full install().
     static int initializeResources(RdmaTransport &transport) {

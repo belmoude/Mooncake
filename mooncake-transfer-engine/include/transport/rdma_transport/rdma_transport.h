@@ -157,7 +157,24 @@ class RdmaTransport : public Transport {
         return context_list_;
     }
 
+    static bool hasLocalKey(const BufferDesc &buffer, int device_id) {
+        return device_id >= 0 &&
+               static_cast<size_t>(device_id) < buffer.lkey.size() &&
+               buffer.lkey[device_id] != 0;
+    }
+
+    static bool hasRemoteKey(const BufferDesc &buffer, int device_id) {
+        return device_id >= 0 &&
+               static_cast<size_t>(device_id) < buffer.rkey.size() &&
+               buffer.rkey[device_id] != 0;
+    }
+
    private:
+    int selectLocalDevice(SegmentDesc *desc, uint64_t offset, size_t length,
+                          std::string_view hint, int &buffer_id, int &device_id,
+                          int retry_count, int hint_buffer_id,
+                          int hint_device_id);
+
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;

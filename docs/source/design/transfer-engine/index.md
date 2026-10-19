@@ -65,6 +65,11 @@ For instance, as illustrated in figure above, to transfer data from buffer 0 (as
 To further maximize bandwidth utilization, if a single request's transfer is internally divided into multiple slices if its length exceeds 64KB.
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
+RDMA device selection requires a valid key for each buffer on the selected
+HCA, including cached selections, hints and retries. Some contexts may have no
+MR for a buffer, for example due to Data Direct pairing. Registration fails and
+rolls back if any chunk has no MR satisfying the requested access permissions.
+
 ### Endpoint Management
 Mooncake Store employs a pair of endpoints to represent the connection between a local RDMA
 NIC and a remote RDMA NIC. In practice, each endpoint

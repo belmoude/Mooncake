@@ -85,6 +85,12 @@ class WorkerPoolTestPeer {
         pool.markRailFailed(path, immediate_pause);
     }
 
+    static bool hasAvailableAlternative(WorkerPool &pool,
+                                        Transport::Slice *slice,
+                                        const std::string &failed_path) {
+        return pool.hasAvailablePeerRailAlternative(slice, failed_path);
+    }
+
     static bool isRailAvailable(WorkerPool &pool, const std::string &path) {
         return pool.isRailAvailable(path);
     }
@@ -228,6 +234,38 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
+
+TEST_F(WorkerPoolRailStateTest, ZeroKeyIsNotAnAlternativePeerRail) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "sparse-peer";
+    desc->protocol = "rdma";
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0":[["nic0","nic1"],[]]})"), 0);
+    for (const auto &name : desc->topology.getHcaList())
+        desc->devices.push_back({name, 0, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x1000;
+    buffer.length = 4096;
+    buffer.rkey.assign(2, 0);
+    const int first = desc->topology.getDeviceIndex("*", "nic0");
+    const int second = desc->topology.getDeviceIndex("*", "nic1");
+    buffer.rkey[first] = 11;
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(metadata_->addLocalSegment(77, "sparse-peer", desc), 0);
+    Transport::Slice slice{};
+    slice.target_id = 77;
+    slice.rdma.dest_addr = 0x1000;
+    slice.length = 16;
+    const std::string path = desc->internedNicPath(first);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+    desc->buffers[0].rkey[second] = 22;
+    EXPECT_TRUE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                            &slice, path));
+    failRail(desc->internedNicPath(second), true);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+}
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
