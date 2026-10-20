@@ -177,11 +177,11 @@ static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
                      endpoint->active() && !endpoint->retired()};
 }
 
-static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
-                            uint64_t offset, size_t length,
-                            const std::string &local_hca, int &buffer_id,
-                            int &device_id, int retry_count = 0,
-                            int hint_buffer_id = -1, int hint_device_id = -1) {
+int WorkerPool::selectPeerDevice(Transport::SegmentDesc *peer_segment_desc,
+                                 uint64_t offset, size_t length,
+                                 const std::string &local_hca, int &buffer_id,
+                                 int &device_id, int retry_count,
+                                 int hint_buffer_id, int hint_device_id) {
     const auto &config = globalConfig();
     int ret = 0;
     if (config.enable_hca_peer_affinity) {
@@ -189,18 +189,32 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
             peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
             retry_count, hint_buffer_id, hint_device_id);
     } else {
-        auto hint = config.enable_dest_device_affinity && retry_count == 0
+        auto hint = config.enable_dest_device_affinity
                         ? std::string_view(local_hca)
                         : std::string_view();
         ret = RdmaTransport::selectDevice(
             peer_segment_desc, offset, length, hint, buffer_id, device_id,
             retry_count, hint_buffer_id, hint_device_id);
-        // Destination affinity is advisory, unlike an explicit source NIC
-        // override. A sparse peer MR may exist only on another legal NIC.
         if (ret && !hint.empty()) {
-            ret = RdmaTransport::selectDevice(peer_segment_desc, offset, length,
-                                              buffer_id, device_id, retry_count,
-                                              hint_buffer_id, -1);
+            int fallback_buffer_id = -1, fallback_device_id = -1;
+            if (RdmaTransport::selectDevice(
+                    peer_segment_desc, offset, length, fallback_buffer_id,
+                    fallback_device_id, retry_count, hint_buffer_id, -1) == 0) {
+                // Accept a fallback only when the named NIC has a zero key
+                // for this buffer, not for a malformed descriptor or range.
+                const auto &keys =
+                    peer_segment_desc->buffers[fallback_buffer_id].rkey;
+                const int named_device_id =
+                    peer_segment_desc->topology.getDeviceIndex("*", hint);
+                if (named_device_id >= 0 &&
+                    keys.size() == peer_segment_desc->devices.size() &&
+                    static_cast<size_t>(named_device_id) < keys.size() &&
+                    keys[named_device_id] == 0) {
+                    buffer_id = fallback_buffer_id;
+                    device_id = fallback_device_id;
+                    ret = 0;
+                }
+            }
         }
     }
     if (ret) return ret;
@@ -409,18 +423,16 @@ int WorkerPool::submitPostSend(
             bool found = false;
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
-                int alt_buffer_id = -1, alt_device_id = -1;
-                if (selectPeerDevice(
-                        peer_segment_desc.get(), slice->rdma.dest_addr,
-                        slice->length, context_.deviceName(), alt_buffer_id,
-                        alt_device_id, static_cast<int>(alt_dev_id + 1)) ||
-                    alt_buffer_id != buffer_id || alt_device_id == device_id) {
+                if (alt_dev_id == (size_t)device_id ||
+                    !RdmaTransport::hasRemoteKey(
+                        peer_segment_desc->buffers[buffer_id],
+                        static_cast<int>(alt_dev_id))) {
                     continue;
                 }
                 const auto &alt_path =
-                    peer_segment_desc->internedNicPath(alt_device_id);
+                    peer_segment_desc->internedNicPath(alt_dev_id);
                 if (isRailAvailable(alt_path)) {
-                    device_id = alt_device_id;
+                    device_id = static_cast<int>(alt_dev_id);
                     last_device_id = device_id;
                     slice->rdma.dest_rkey =
                         peer_segment_desc->buffers[buffer_id].rkey[device_id];
@@ -1075,19 +1087,16 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 for (size_t alt_dev_id = 0;
                      alt_dev_id < peer_segment_desc->devices.size();
                      ++alt_dev_id) {
-                    int alt_buffer_id = -1, alt_device_id = -1;
-                    if (selectPeerDevice(
-                            peer_segment_desc.get(), slice->rdma.dest_addr,
-                            slice->length, context_.deviceName(), alt_buffer_id,
-                            alt_device_id, static_cast<int>(alt_dev_id + 1)) ||
-                        alt_buffer_id != buffer_id ||
-                        alt_device_id == device_id) {
+                    if (alt_dev_id == (size_t)device_id ||
+                        !RdmaTransport::hasRemoteKey(
+                            peer_segment_desc->buffers[buffer_id],
+                            static_cast<int>(alt_dev_id))) {
                         continue;
                     }
                     const auto &alt_path =
-                        peer_segment_desc->internedNicPath(alt_device_id);
+                        peer_segment_desc->internedNicPath(alt_dev_id);
                     if (isRailAvailable(alt_path)) {
-                        device_id = alt_device_id;
+                        device_id = static_cast<int>(alt_dev_id);
                         slice->rdma.dest_rkey =
                             peer_segment_desc->buffers[buffer_id]
                                 .rkey[device_id];
@@ -1182,8 +1191,8 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
             auto source = reinterpret_cast<uint64_t>(slice->source_addr);
             auto buffer_start = reinterpret_cast<uint64_t>(buffer.addr);
             auto buffer_end = buffer_start + buffer.length;
-            if (buffer_start <= source && source <= buffer_end &&
-                slice->length <= buffer_end - source &&
+            if (buffer_start <= source &&
+                source + slice->length <= buffer_end &&
                 RdmaTransport::hasLocalKey(buffer, device_id)) {
                 buffer_id = static_cast<int>(idx);
                 break;
@@ -1446,19 +1455,33 @@ void WorkerPool::maybeActivateRecoveredContext() {
 
 bool WorkerPool::hasAvailablePeerRailAlternative(
     Transport::Slice *slice, const std::string &failed_peer_path) {
-    auto desc =
+    auto peer_segment_desc =
         context_.engine().meta()->getSegmentDescByID(slice->target_id, false);
-    if (!desc) return false;
-    // Use the real peer selector: key existence, protocol and affinity must
-    // agree with redispatch before the current rail can be paused.
-    for (size_t i = 0; i < desc->devices.size(); ++i) {
-        int buffer_id = -1, device_id = -1;
-        if (selectPeerDevice(desc.get(), slice->rdma.dest_addr, slice->length,
-                             context_.deviceName(), buffer_id, device_id,
-                             static_cast<int>(i + 1)))
+    if (!peer_segment_desc) return false;
+
+    int buffer_id = -1;
+    for (size_t idx = 0; idx < peer_segment_desc->buffers.size(); ++idx) {
+        auto &buffer = peer_segment_desc->buffers[idx];
+        uint64_t buffer_start = reinterpret_cast<uint64_t>(buffer.addr);
+        uint64_t buffer_end = buffer_start + buffer.length;
+        if (buffer_start <= slice->rdma.dest_addr &&
+            slice->rdma.dest_addr + slice->length <= buffer_end) {
+            buffer_id = static_cast<int>(idx);
+            break;
+        }
+    }
+    if (buffer_id < 0) return false;
+
+    for (size_t dev_id = 0; dev_id < peer_segment_desc->devices.size();
+         ++dev_id) {
+        if (!RdmaTransport::hasRemoteKey(peer_segment_desc->buffers[buffer_id],
+                                         static_cast<int>(dev_id))) {
             continue;
-        const auto &path = desc->internedNicPath(device_id);
-        if (path != failed_peer_path && isRailAvailable(path)) return true;
+        }
+        const auto &peer_path = peer_segment_desc->internedNicPath(dev_id);
+        if (peer_path != failed_peer_path && isRailAvailable(peer_path)) {
+            return true;
+        }
     }
     return false;
 }
