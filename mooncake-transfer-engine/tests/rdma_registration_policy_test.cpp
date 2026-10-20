@@ -24,7 +24,7 @@
 
 namespace {
 std::atomic<int> calls{0}, live_mrs{0}, device_probes{0}, numa_probes{0};
-int fail_call = 0, zero_keys_from_call = 0;
+int fail_call = 0;
 ibv_pd domains[3]{};
 std::unordered_set<void *> device_buffers;
 }  // namespace
@@ -55,8 +55,6 @@ extern "C" ibv_mr *ibv_reg_mr(ibv_pd *pd, void *addr, size_t length, int) {
     mr->length = length;
     mr->lkey = 1 + static_cast<uint32_t>(pd - domains);
     mr->rkey = mr->lkey + 10;
-    if (zero_keys_from_call && call_number >= zero_keys_from_call)
-        mr->lkey = mr->rkey = 0;
     ++live_mrs;
     return mr;
 }
@@ -118,7 +116,7 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
    protected:
     void SetUp() override {
         calls = live_mrs = device_probes = numa_probes = 0;
-        fail_call = zero_keys_from_call = 0;
+        fail_call = 0;
         device_buffers.clear();
         old_limit = globalConfig().max_mr_size;
         old_parallel = globalConfig().parallel_reg_mr;
@@ -191,18 +189,6 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
     int old_parallel;
 };
 
-TEST_P(RdmaRegistrationPolicyTest, FullRegistrationRejectsMissingMrs) {
-    for (auto &context : transport->getContextList())
-        RdmaContextTestPeer::bindProtectionDomain(*context, nullptr);
-    for (int parallel : {0, 1}) {
-        globalConfig().parallel_reg_mr = parallel;
-        EXPECT_EQ(reg(0), ERR_ADDRESS_NOT_REGISTERED);
-        EXPECT_EQ(calls, 0);
-        EXPECT_EQ(live_mrs, 0);
-        EXPECT_TRUE(desc()->buffers.empty());
-    }
-}
-
 TEST_P(RdmaRegistrationPolicyTest, SparseContextsKeepKeyIndices) {
     const int missing = index("nic0");
     RdmaContextTestPeer::bindProtectionDomain(
@@ -217,30 +203,6 @@ TEST_P(RdmaRegistrationPolicyTest, SparseContextsKeepKeyIndices) {
         EXPECT_EQ(buffer.lkey[i] != 0, i != missing);
         EXPECT_EQ(buffer.rkey[i] != 0, i != missing);
     }
-}
-
-TEST_P(RdmaRegistrationPolicyTest, UnusableLaterChunkRollsBackEarlierMrs) {
-    for (int parallel : {0, 1}) {
-        globalConfig().parallel_reg_mr = parallel;
-        calls = 0;
-        zero_keys_from_call = 4;
-        EXPECT_EQ(reg(0, 2 * pagesize), ERR_ADDRESS_NOT_REGISTERED);
-        EXPECT_EQ(calls, 6);
-        EXPECT_EQ(live_mrs, 0);
-        EXPECT_TRUE(desc()->buffers.empty());
-    }
-}
-
-TEST_P(RdmaRegistrationPolicyTest, FullFallbackRejectsMissingMrs) {
-    useLocal();
-    for (auto &context : transport->getContextList()) {
-        RdmaContextTestPeer::bindProtectionDomain(*context, nullptr);
-        context->set_active(false);
-    }
-    EXPECT_EQ(reg(0), ERR_ADDRESS_NOT_REGISTERED);
-    EXPECT_EQ(calls, 0);
-    EXPECT_EQ(live_mrs, 0);
-    EXPECT_TRUE(desc()->buffers.empty());
 }
 
 TEST_P(RdmaRegistrationPolicyTest, DefaultAllDoesNotProbeBeforeRegistration) {
@@ -355,14 +317,6 @@ TEST_P(RdmaRegistrationPolicyTest, FailureDoesNotRetryOtherHcasAndRollsBack) {
     EXPECT_NE(reg(0, 2 * pagesize), 0);
     EXPECT_EQ(calls, 2);
     EXPECT_EQ(live_mrs, 0);
-    EXPECT_TRUE(desc()->buffers.empty());
-}
-TEST_P(RdmaRegistrationPolicyTest, SelectedPlaceholderCannotPublishSuccess) {
-    useLocal();
-    RdmaContextTestPeer::bindProtectionDomain(
-        *transport->getContextList()[index("nic0")], nullptr);
-    EXPECT_NE(reg(0), 0);
-    EXPECT_EQ(calls, 0);
     EXPECT_TRUE(desc()->buffers.empty());
 }
 TEST_P(RdmaRegistrationPolicyTest, BatchMixesHostAndDeviceWithoutPolicyLeak) {

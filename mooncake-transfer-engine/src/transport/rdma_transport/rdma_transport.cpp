@@ -647,22 +647,13 @@ int RdmaTransport::registerLocalMemoryInternal(
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        bool has_usable_mr = false;
         for (size_t i = 0; i < context_list_.size(); ++i) {
             auto &context = context_list_[i];
-            const auto lkey = selected[i] ? context->lkey(chunk_addr) : 0;
-            const auto rkey = remote_accessible && selected[i]
-                                  ? context->rkey(chunk_addr)
-                                  : 0;
-            buffer_desc.lkey.push_back(lkey);
-            if (remote_accessible) buffer_desc.rkey.push_back(rkey);
-            has_usable_mr |= lkey != 0 && (!remote_accessible || rkey != 0);
-        }
-        if (!has_usable_mr) {
-            LOG(ERROR) << "No usable MR for " << resolved_name;
-            unregisterChunkMRs(chunk_addr);
-            rollbackChunks(ci);
-            return ERR_ADDRESS_NOT_REGISTERED;
+            buffer_desc.lkey.push_back(selected[i] ? context->lkey(chunk_addr)
+                                                   : 0);
+            if (remote_accessible)
+                buffer_desc.rkey.push_back(
+                    selected[i] ? context->rkey(chunk_addr) : 0);
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;

@@ -67,8 +67,7 @@ Each slice might use a different path, enabling collaborative work among all RDM
 
 RDMA device selection requires a valid key for each buffer on the selected
 HCA, including cached selections, hints and retries. Some contexts may have no
-MR for a buffer, for example due to Data Direct pairing. Registration fails and
-rolls back if any chunk has no MR satisfying the requested access permissions.
+MR for a buffer, for example due to Data Direct pairing.
 
 ### GPU Memory Registration Policy
 
