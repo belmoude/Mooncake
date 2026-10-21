@@ -64,6 +64,20 @@ static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
+static bool parseRdmaRegistrationPolicy(const std::string& value,
+                                        RdmaRegistrationPolicy& policy) {
+    if (value == "all")
+        policy = RdmaRegistrationPolicy::All;
+    else if (value == "local")
+        policy = RdmaRegistrationPolicy::TopologyLocal;
+    else {
+        LOG(ERROR) << "Invalid rdma_registration_policy: " << value
+                   << "; expected all or local";
+        return false;
+    }
+    return true;
+}
+
 enum class ScatterTransferCompletionStatus : int {
     COMPLETED = 0,
     FAILED_DRAINED = -1,
@@ -320,15 +334,8 @@ int TransferEnginePy::initializeExtWithRdmaPolicy(
     const char* protocol, const char* device_name, const char* metadata_type,
     const std::string& rdma_registration_policy) {
     RdmaRegistrationPolicy policy;
-    if (rdma_registration_policy == "all")
-        policy = RdmaRegistrationPolicy::All;
-    else if (rdma_registration_policy == "local")
-        policy = RdmaRegistrationPolicy::TopologyLocal;
-    else {
-        LOG(ERROR) << "Invalid rdma_registration_policy: "
-                   << rdma_registration_policy << "; expected all or local";
+    if (!parseRdmaRegistrationPolicy(rdma_registration_policy, policy))
         return ERR_INVALID_ARGUMENT;
-    }
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
@@ -1399,6 +1406,22 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
 int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
     const std::string& location) {
+    return batchRegisterMemoryWithRdmaPolicy(std::move(buffer_addresses),
+                                             std::move(capacities), location,
+                                             std::nullopt);
+}
+
+int TransferEnginePy::batchRegisterMemoryWithRdmaPolicy(
+    std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
+    const std::string& location,
+    const std::optional<std::string>& rdma_registration_policy) {
+    std::optional<RdmaRegistrationPolicy> policy;
+    if (rdma_registration_policy) {
+        RdmaRegistrationPolicy value;
+        if (!parseRdmaRegistrationPolicy(*rdma_registration_policy, value))
+            return ERR_INVALID_ARGUMENT;
+        policy = value;
+    }
     pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
@@ -1406,6 +1429,8 @@ int TransferEnginePy::batchRegisterMemory(
         buffers.push_back(
             BufferEntry{(void*)buffer_addresses[i], capacities[i]});
     }
+    if (policy)
+        return engine_->registerLocalMemoryBatch(buffers, *policy, location);
     return engine_->registerLocalMemoryBatch(buffers, location);
 }
 
@@ -1425,6 +1450,21 @@ int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      bool remote_accessible) {
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity, location,
+                                        remote_accessible);
+}
+
+int TransferEnginePy::registerMemoryWithRdmaPolicy(
+    uintptr_t buffer_addr, size_t capacity, const std::string& location,
+    bool remote_accessible,
+    const std::optional<std::string>& rdma_registration_policy) {
+    if (!rdma_registration_policy)
+        return registerMemory(buffer_addr, capacity, location,
+                              remote_accessible);
+    RdmaRegistrationPolicy policy;
+    if (!parseRdmaRegistrationPolicy(*rdma_registration_policy, policy))
+        return ERR_INVALID_ARGUMENT;
+    return engine_->registerLocalMemory(reinterpret_cast<void*>(buffer_addr),
+                                        capacity, policy, location,
                                         remote_accessible);
 }
 
@@ -1971,15 +2011,18 @@ PYBIND11_MODULE(engine, m) {
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
-            .def("register_memory", &TransferEnginePy::registerMemory,
+            .def("register_memory",
+                 &TransferEnginePy::registerMemoryWithRdmaPolicy,
                  py::arg("buffer_addr"), py::arg("capacity"),
                  py::arg("location") = kWildcardLocation,
-                 py::arg("remote_accessible") = true)
+                 py::arg("remote_accessible") = true, py::kw_only(),
+                 py::arg("rdma_registration_policy") = py::none())
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
             .def("batch_register_memory",
-                 &TransferEnginePy::batchRegisterMemory,
+                 &TransferEnginePy::batchRegisterMemoryWithRdmaPolicy,
                  py::arg("buffer_addresses"), py::arg("capacities"),
-                 py::arg("location") = kWildcardLocation)
+                 py::arg("location") = kWildcardLocation, py::kw_only(),
+                 py::arg("rdma_registration_policy") = py::none())
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
             .def("get_local_topology", &TransferEnginePy::getLocalTopology,

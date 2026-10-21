@@ -12,12 +12,14 @@
 
 #include <atomic>
 #include <cerrno>
+#include <future>
 #include <memory>
 #include <unordered_set>
 
 #include "config.h"
 #include "rdma_test_peers.h"
 #include "transfer_engine.h"
+#include "transfer_engine_impl.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 
 namespace {
@@ -74,6 +76,40 @@ extern "C" int numa_move_pages(int, unsigned long count, void **, const int *,
 }
 
 namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static void prepare(TransferEngineImpl &engine,
+                        std::shared_ptr<TransferMetadata> metadata,
+                        std::shared_ptr<Topology> topology,
+                        std::shared_ptr<Transport> transport = nullptr) {
+        engine.local_server_name_ = "registration-policy-test";
+        engine.metadata_ = std::move(metadata);
+        engine.local_topology_ = std::move(topology);
+        engine.multi_transports_ = std::make_shared<MultiTransport>(
+            engine.metadata_, engine.local_server_name_);
+        if (transport) attach(engine, std::move(transport));
+    }
+    static void attach(TransferEngineImpl &engine,
+                       std::shared_ptr<Transport> transport) {
+        const std::string name = transport->getName();
+        engine.multi_transports_->transport_map_[name] = std::move(transport);
+    }
+    static RdmaRegistrationPolicy policy(TransferEngineImpl &engine,
+                                         void *addr) {
+        return engine.local_memory_regions_.at((uintptr_t)addr)
+            .rdma_registration_policy;
+    }
+    static size_t records(TransferEngineImpl &engine) {
+        return engine.local_memory_regions_.size();
+    }
+    static size_t pending(TransferEngineImpl &engine) {
+        return engine.registering_memory_regions_.size();
+    }
+    static int replay(TransferEngineImpl &engine, Transport *transport) {
+        return engine.replayLocalMemory(transport);
+    }
+};
+
 namespace {
 using Policy = RdmaRegistrationPolicy;
 class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
@@ -102,9 +138,9 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
                 LOCAL_SEGMENT_ID, "registration-policy-test", std::move(desc)),
             0);
         if (GetParam())
-            transport = std::make_unique<RdmaTwoSidedTransport>();
+            transport = std::make_shared<RdmaTwoSidedTransport>();
         else
-            transport = std::make_unique<RdmaTransport>();
+            transport = std::make_shared<RdmaTransport>();
         RdmaTransportTestPeer::bindMetadata(*transport, metadata,
                                             "registration-policy-test");
         RdmaTransportTestPeer::bindTopology(*transport, topology);
@@ -146,7 +182,7 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
                                                      Policy::TopologyLocal);
     }
     std::vector<void *> buffers;
-    std::unique_ptr<RdmaTransport> transport;
+    std::shared_ptr<RdmaTransport> transport;
     std::shared_ptr<TransferMetadata> metadata;
     std::shared_ptr<Topology> topology;
     uint64_t old_limit;
@@ -333,6 +369,150 @@ TEST_P(RdmaRegistrationPolicyTest,
                                           16, "nic1", buffer_id, device_id),
               0);
 }
+TEST_P(RdmaRegistrationPolicyTest, PublicOverridesDoNotChangeTransportDefault) {
+    useLocal();
+    device_buffers.insert(buffers[1]);
+    ASSERT_EQ(transport->registerLocalMemory(buffers[0], pagesize, Policy::All,
+                                             kWildcardLocation, true, false),
+              0);
+    ASSERT_EQ(reg(1), 0);
+    EXPECT_EQ(calls, 4);
+    ASSERT_EQ(transport->unregisterLocalMemory(buffers[0], false), 0);
+    ASSERT_EQ(transport->unregisterLocalMemory(buffers[1], false), 0);
+    ASSERT_EQ(transport->registerLocalMemoryBatch(
+                  {{buffers[0], pagesize}, {buffers[1], pagesize}}, Policy::All,
+                  kWildcardLocation),
+              0);
+    EXPECT_EQ(calls, 10);
+}
+
+TEST_P(RdmaRegistrationPolicyTest, EngineRecordsConcurrentSingleOverrides) {
+    useLocal();
+    device_buffers.insert(buffers[1]);
+    TransferEngineImpl engine;
+    ASSERT_EQ(engine.setRdmaRegistrationPolicy(Policy::TopologyLocal), 0);
+    TransferEngineImplTestPeer::prepare(engine, metadata, topology, transport);
+    auto first = std::async(std::launch::async, [&] {
+        return engine.registerLocalMemory(buffers[0], pagesize, Policy::All,
+                                          kWildcardLocation, true, false);
+    });
+    ASSERT_EQ(engine.registerLocalMemory(buffers[1], pagesize,
+                                         kWildcardLocation, true, false),
+              0);
+    ASSERT_EQ(first.get(), 0);
+    EXPECT_EQ(calls, 4);
+    EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[0]),
+              Policy::All);
+    EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[1]),
+              Policy::TopologyLocal);
+    ASSERT_EQ(engine.unregisterLocalMemory(buffers[0], false), 0);
+    ASSERT_EQ(engine.unregisterLocalMemory(buffers[1], false), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::records(engine), 0);
+}
+
+TEST_P(RdmaRegistrationPolicyTest, ReplayUsesSnapshotsInBothDefaultDirections) {
+    // The transport default intentionally differs from one of the snapshots.
+    useLocal();
+    device_buffers.insert(buffers[1]);
+    for (Policy default_policy : {Policy::All, Policy::TopologyLocal}) {
+        TransferEngineImpl engine;
+        ASSERT_EQ(engine.setRdmaRegistrationPolicy(default_policy), 0);
+        TransferEngineImplTestPeer::prepare(engine, metadata, topology);
+        Policy override_policy =
+            default_policy == Policy::All ? Policy::TopologyLocal : Policy::All;
+        ASSERT_EQ(
+            engine.registerLocalMemory(buffers[0], pagesize, override_policy),
+            0);
+        ASSERT_EQ(engine.registerLocalMemoryBatch({{buffers[1], pagesize}},
+                                                  kWildcardLocation),
+                  0);
+        EXPECT_EQ(live_mrs, 0);
+        EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[0]),
+                  override_policy);
+        EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[1]),
+                  default_policy);
+        const int previous_calls = calls.load();
+        TransferEngineImplTestPeer::attach(engine, transport);
+        ASSERT_EQ(TransferEngineImplTestPeer::replay(engine, transport.get()),
+                  0);
+        EXPECT_EQ(calls - previous_calls, 4);
+        EXPECT_EQ(live_mrs, 4);
+        ASSERT_EQ(engine.unregisterLocalMemory(buffers[0], false), 0);
+        ASSERT_EQ(engine.unregisterLocalMemory(buffers[1], false), 0);
+        EXPECT_EQ(live_mrs, 0);
+    }
+}
+
+TEST_P(RdmaRegistrationPolicyTest,
+       BatchFailureReleasesSnapshotsAndAllowsRetry) {
+    device_buffers.insert(buffers[1]);
+    TransferEngineImpl engine;
+    ASSERT_EQ(engine.setRdmaRegistrationPolicy(Policy::TopologyLocal), 0);
+    TransferEngineImplTestPeer::prepare(engine, metadata, topology, transport);
+    const std::vector<BufferEntry> batch = {{buffers[0], pagesize},
+                                            {buffers[1], pagesize}};
+    fail_call = 4;
+    EXPECT_NE(engine.registerLocalMemoryBatch(batch, Policy::All), 0);
+    EXPECT_EQ(live_mrs, 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::records(engine), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::pending(engine), 0);
+    fail_call = 0;
+    ASSERT_EQ(engine.registerLocalMemoryBatch(batch, Policy::All), 0);
+    EXPECT_EQ(live_mrs, 6);
+    for (void *addr : buffers)
+        EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, addr),
+                  Policy::All);
+    EXPECT_EQ(
+        engine.registerLocalMemory(buffers[0], pagesize, Policy::TopologyLocal),
+        ERR_ADDRESS_OVERLAPPED);
+    ASSERT_EQ(engine.unregisterLocalMemoryBatch({buffers[0], buffers[1]}), 0);
+    ASSERT_EQ(engine.registerLocalMemory(buffers[0], pagesize), 0);
+    EXPECT_EQ(live_mrs, 1);
+    EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[0]),
+              Policy::TopologyLocal);
+    ASSERT_EQ(engine.unregisterLocalMemory(buffers[0], false), 0);
+}
+
+TEST_P(RdmaRegistrationPolicyTest,
+       InvalidOverrideHasNoRegistrationSideEffects) {
+    TransferEngineImpl engine;
+    TransferEngineImplTestPeer::prepare(engine, metadata, topology, transport);
+    const Policy invalid = static_cast<Policy>(99);
+    EXPECT_EQ(engine.registerLocalMemory(buffers[0], pagesize, invalid),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(
+        engine.registerLocalMemoryBatch({{buffers[0], pagesize}}, invalid),
+        ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(transport->registerLocalMemory(buffers[0], pagesize, invalid,
+                                             kWildcardLocation, true, false),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::records(engine), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::pending(engine), 0);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_P(RdmaRegistrationPolicyTest, MultiProtocolSnapshotKeepsExplicitPolicy) {
+    TransferEngineImpl engine;
+    ASSERT_EQ(engine.setRdmaRegistrationPolicy(Policy::TopologyLocal), 0);
+    TransferEngineImplTestPeer::prepare(engine, metadata, topology, transport);
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> request;
+    request[transport->getName()].emplace_back(buffers[0], pagesize,
+                                               kWildcardLocation, true, false);
+    ASSERT_EQ(engine.mp_registerLocalMemory(request, Policy::All), 0);
+    EXPECT_EQ(live_mrs, 3);
+    EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[0]),
+              Policy::All);
+    ASSERT_EQ(engine.mp_unregisterLocalMemory(request), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::records(engine), 0);
+    ASSERT_EQ(engine.mp_registerLocalMemory(request), 0);
+    EXPECT_EQ(live_mrs, 1);
+    EXPECT_EQ(TransferEngineImplTestPeer::policy(engine, buffers[0]),
+              Policy::TopologyLocal);
+    ASSERT_EQ(engine.mp_unregisterLocalMemory(request), 0);
+}
+#endif
+
 INSTANTIATE_TEST_SUITE_P(RdmaAndTwoSided, RdmaRegistrationPolicyTest,
                          ::testing::Bool());
 
@@ -341,6 +521,14 @@ TEST(RdmaRegistrationPolicy, EngineFreezesConfigurationAtInitAndAfterMove) {
     if (first.isUsingTent()) {
         EXPECT_EQ(first.setRdmaRegistrationPolicy(Policy::TopologyLocal),
                   ERR_NOT_IMPLEMENTED);
+        EXPECT_EQ(
+            first.registerLocalMemory(nullptr, pagesize, Policy::TopologyLocal),
+            ERR_NOT_IMPLEMENTED);
+        EXPECT_EQ(first.registerLocalMemoryBatch({}, Policy::TopologyLocal),
+                  ERR_NOT_IMPLEMENTED);
+        EXPECT_EQ(first.registerLocalMemory(nullptr, pagesize,
+                                            static_cast<Policy>(99)),
+                  ERR_INVALID_ARGUMENT);
         return;
     }
     ASSERT_EQ(first.setRdmaRegistrationPolicy(Policy::TopologyLocal), 0);

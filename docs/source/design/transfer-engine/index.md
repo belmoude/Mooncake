@@ -100,6 +100,41 @@ the default when initialization starts, including a failed initialization.
 Create another Engine to use another default. TENT rejects `TopologyLocal`;
 setting `All` is a no-op in TENT.
 
+Each registration can override the instance default. The C++ overloads accept
+the policy as a separate argument, so existing signatures and positional
+arguments retain their behavior:
+
+```cpp
+rc = engine.registerLocalMemory(gpu_addr_a, length,
+                                RdmaRegistrationPolicy::All);
+rc = engine.registerLocalMemoryBatch(
+    {{gpu_addr_b, length}, {gpu_addr_c, length}},
+    RdmaRegistrationPolicy::TopologyLocal);
+```
+
+Python uses an optional keyword on the existing registration methods:
+
+```python
+engine.register_memory(gpu_addr_a, length, rdma_registration_policy="all")
+engine.batch_register_memory([gpu_addr_b, gpu_addr_c], [length, length],
+                             rdma_registration_policy="local")
+```
+
+Omit the keyword or pass `None` to use the instance default. Both `"all"` and
+`"local"` override it for this call without changing other registrations.
+A batch uses one policy; register different-policy subsets in separate calls.
+The C++ multi-protocol API also provides `mp_registerLocalMemory(buffer_map,
+policy)`, applying one policy to the operation while retaining the existing
+`RegisteredBuffer` layout. Non-RDMA transports retain their registration behavior.
+
+Engine records keep each buffer's effective policy, including buffers registered
+before RDMA is installed. A later installation replays that policy and selects
+the HCA set against the current topology. Overriding the policy does not replace
+an existing registration: unregister the buffer before registering it again.
+For single-buffer and batch registration, TENT accepts an explicit `All` through
+its existing registration path and rejects `TopologyLocal` with
+`ERR_NOT_IMPLEMENTED`. The multi-protocol overload is classic-only.
+
 CPU, pinned host, managed and unclassified memory retain the existing full
 registration path. Without active preferred HCAs or a matching location,
 device memory also uses that path. Registration failure on a selected HCA
