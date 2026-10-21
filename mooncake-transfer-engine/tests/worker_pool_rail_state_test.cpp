@@ -80,9 +80,23 @@ namespace mooncake {
 
 class WorkerPoolTestPeer {
    public:
+    static int selectPeerDevice(Transport::SegmentDesc *desc, uint64_t offset,
+                                size_t length, const std::string &local_hca,
+                                int &buffer_id, int &device_id,
+                                int retry_count = 0) {
+        return WorkerPool::selectPeerDevice(desc, offset, length, local_hca,
+                                            buffer_id, device_id, retry_count);
+    }
+
     static void markRailFailed(WorkerPool &pool, const std::string &path,
                                bool immediate_pause) {
         pool.markRailFailed(path, immediate_pause);
+    }
+
+    static bool hasAvailableAlternative(WorkerPool &pool,
+                                        Transport::Slice *slice,
+                                        const std::string &failed_path) {
+        return pool.hasAvailablePeerRailAlternative(slice, failed_path);
     }
 
     static bool isRailAvailable(WorkerPool &pool, const std::string &path) {
@@ -182,12 +196,30 @@ namespace {
 constexpr const char *kPeerA = "10.0.0.1@mlx5_bond_0";
 constexpr const char *kPeerB = "10.0.0.1@mlx5_bond_1";
 
+Transport::SegmentDesc makeAffinityPeerDesc() {
+    Transport::SegmentDesc desc;
+    desc.name = "affinity-peer";
+    desc.protocol = "rdma";
+    EXPECT_EQ(desc.topology.parse(R"({"cpu:0":[["nic0","nic1"],[]]})"), 0);
+    for (const auto &name : desc.topology.getHcaList())
+        desc.devices.push_back({name, 0, "", ""});
+    Transport::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x1000;
+    buffer.length = 4096;
+    buffer.rkey.assign(desc.devices.size(), 11);
+    desc.buffers.push_back(buffer);
+    return desc;
+}
+
 class WorkerPoolRailStateTest : public ::testing::Test {
    protected:
     void SetUp() override {
         // The context below is expected to fail to open, and that path is
         // noisy. Silence it so gtest failures stay readable.
         previous_min_log_level_ = FLAGS_minloglevel;
+        previous_dest_affinity_ = globalConfig().enable_dest_device_affinity;
+        previous_peer_affinity_ = globalConfig().enable_hca_peer_affinity;
         FLAGS_minloglevel = google::GLOG_FATAL;
 
         metadata_ = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
@@ -211,6 +243,8 @@ class WorkerPoolRailStateTest : public ::testing::Test {
         context_.reset();
         transport_.reset();
         FLAGS_minloglevel = previous_min_log_level_;
+        globalConfig().enable_dest_device_affinity = previous_dest_affinity_;
+        globalConfig().enable_hca_peer_affinity = previous_peer_affinity_;
     }
 
     void failRail(const std::string &path, bool immediate_pause = false) {
@@ -223,11 +257,121 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     }
 
     int previous_min_log_level_ = 0;
+    bool previous_dest_affinity_ = false;
+    bool previous_peer_affinity_ = false;
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<RdmaTransport> transport_;
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
+
+TEST_F(WorkerPoolRailStateTest, DestinationAffinityKeepsNamedNicOnRetries) {
+    globalConfig().enable_dest_device_affinity = true;
+    globalConfig().enable_hca_peer_affinity = false;
+    auto desc = makeAffinityPeerDesc();
+    for (const auto &name : {"nic0", "nic1"}) {
+        const int named = desc.topology.getDeviceIndex("*", name);
+        for (int retry : {0, 1, 2, 5}) {
+            int buffer_id = -1, device_id = -1;
+            ASSERT_EQ(WorkerPoolTestPeer::selectPeerDevice(
+                          &desc, 0x1000, 16, name, buffer_id, device_id, retry),
+                      0);
+            EXPECT_EQ(buffer_id, 0);
+            EXPECT_EQ(device_id, named);
+        }
+    }
+}
+
+TEST_F(WorkerPoolRailStateTest, DestinationAffinityFallsBackForZeroKeyOnly) {
+    globalConfig().enable_dest_device_affinity = true;
+    globalConfig().enable_hca_peer_affinity = false;
+    auto desc = makeAffinityPeerDesc();
+    const int first = desc.topology.getDeviceIndex("*", "nic0");
+    const int second = desc.topology.getDeviceIndex("*", "nic1");
+    desc.buffers[0].rkey[first] = 0;
+    for (int retry : {0, 1, 2, 5}) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(WorkerPoolTestPeer::selectPeerDevice(
+                      &desc, 0x1000, 16, "nic0", buffer_id, device_id, retry),
+                  0);
+        EXPECT_EQ(buffer_id, 0);
+        EXPECT_EQ(device_id, second);
+    }
+    int buffer_id = -1, device_id = -1;
+    EXPECT_EQ(WorkerPoolTestPeer::selectPeerDevice(&desc, 0x3000, 16, "nic0",
+                                                   buffer_id, device_id),
+              ERR_ADDRESS_NOT_REGISTERED);
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc.buffers[0].protocol = "tcp";
+    EXPECT_EQ(WorkerPoolTestPeer::selectPeerDevice(&desc, 0x1000, 16, "nic0",
+                                                   buffer_id, device_id),
+              ERR_ADDRESS_NOT_REGISTERED);
+    desc.buffers[0].protocol = "rdma";
+#endif
+    desc.buffers[0].rkey[second] = 0;
+    EXPECT_EQ(WorkerPoolTestPeer::selectPeerDevice(&desc, 0x1000, 16, "nic0",
+                                                   buffer_id, device_id),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(WorkerPoolRailStateTest, DestinationAffinityRejectsMalformedKeyArrays) {
+    globalConfig().enable_dest_device_affinity = true;
+    globalConfig().enable_hca_peer_affinity = false;
+    auto desc = makeAffinityPeerDesc();
+    const int named = desc.topology.getDeviceIndex("*", "nic1");
+    ASSERT_GT(named, 0);
+    // Another NIC has a key, but a truncated key array is not a skipped MR.
+    desc.buffers[0].rkey.resize(named);
+    for (int retry : {0, 1, 2}) {
+        int buffer_id = -1, device_id = -1;
+        EXPECT_EQ(WorkerPoolTestPeer::selectPeerDevice(
+                      &desc, 0x1000, 16, "nic1", buffer_id, device_id, retry),
+                  ERR_ADDRESS_NOT_REGISTERED);
+    }
+    desc = makeAffinityPeerDesc();
+    desc.buffers[0].rkey[desc.topology.getDeviceIndex("*", "nic0")] = 0;
+    desc.devices.push_back({"nic2", 0, "", ""});
+    int buffer_id = -1, device_id = -1;
+    EXPECT_EQ(WorkerPoolTestPeer::selectPeerDevice(&desc, 0x1000, 16, "nic0",
+                                                   buffer_id, device_id),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(WorkerPoolRailStateTest, ZeroKeyIsNotAnAlternativePeerRail) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "sparse-peer";
+    desc->protocol = "rdma";
+    // nic1 is outside cpu:0's topology entry, but legacy failover can use it
+    // when this buffer has an actual MR on that device.
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0":[["nic0"],[]],)"
+                                   R"("cpu:1":[["nic1"],[]]})"),
+              0);
+    for (const auto &name : desc->topology.getHcaList())
+        desc->devices.push_back({name, 0, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x1000;
+    buffer.length = 4096;
+    buffer.rkey.assign(2, 0);
+    const int first = desc->topology.getDeviceIndex("*", "nic0");
+    const int second = desc->topology.getDeviceIndex("*", "nic1");
+    buffer.rkey[first] = 11;
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(metadata_->addLocalSegment(77, "sparse-peer", desc), 0);
+    Transport::Slice slice{};
+    slice.target_id = 77;
+    slice.rdma.dest_addr = 0x1000;
+    slice.length = 16;
+    const std::string path = desc->internedNicPath(first);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+    desc->buffers[0].rkey[second] = 22;
+    EXPECT_TRUE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                            &slice, path));
+    failRail(desc->internedNicPath(second), true);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+}
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));

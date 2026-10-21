@@ -1040,7 +1040,7 @@ Status RdmaTransport::submitTransferTask(
         if (local_device_cache.select(
                 local_segment_desc, (uint64_t)request.source, request.length,
                 request_buffer_id, request_device_id, [&] {
-                    return selectDevice(
+                    return selectLocalDevice(
                         local_segment_desc.get(), (uint64_t)request.source,
                         request.length, request_hint, request_buffer_id,
                         request_device_id, 0, last_local_buffer_id,
@@ -1107,10 +1107,11 @@ Status RdmaTransport::submitTransferTask(
                             last_local_device_buffer_id == last_local_buffer_id
                         ? last_local_device_id
                         : -1;
-                if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 slice_hint, buffer_id, device_id, retry_cnt++,
-                                 last_local_buffer_id, slice_hint_device_id))
+                if (selectLocalDevice(
+                        local_segment_desc.get(), (uint64_t)slice->source_addr,
+                        slice->length, slice_hint, buffer_id, device_id,
+                        retry_cnt++, last_local_buffer_id,
+                        slice_hint_device_id))
                     continue;
                 assert(device_id >= 0 &&
                        static_cast<size_t>(device_id) < context_list_.size());
@@ -1435,11 +1436,14 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     return desc->topology.selectDevice(kWildcardLocation, retry_count);
 }
 
-int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
-                     size_t length, std::string_view hint,
-                     std::string_view local_hca, bool by_local_hca,
-                     int &buffer_id, int &device_id, int retry_count,
-                     int hint_buffer_id, int hint_device_id) {
+enum class KeyRole { Local, Remote };
+
+int selectDeviceImpl(
+    RdmaTransport::SegmentDesc *desc, uint64_t offset, size_t length,
+    std::string_view hint, std::string_view local_hca, bool by_local_hca,
+    int &buffer_id, int &device_id, int retry_count, int hint_buffer_id,
+    int hint_device_id, KeyRole key_role,
+    const std::vector<std::shared_ptr<RdmaContext>> *contexts = nullptr) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto &buffers = desc->buffers;
 
@@ -1451,25 +1455,52 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             !bufferCoversRange(buffer.addr, buffer.length, offset, length)) {
             return false;
         }
+        auto eligible = [&](int id) {
+            if (id < 0 || (!desc->devices.empty() &&
+                           static_cast<size_t>(id) >= desc->devices.size()))
+                return false;
+            if (contexts && (static_cast<size_t>(id) >= contexts->size() ||
+                             !(*contexts)[id] || !(*contexts)[id]->active()))
+                return false;
+            return key_role == KeyRole::Local
+                       ? RdmaTransport::hasLocalKey(buffer, id)
+                       : RdmaTransport::hasRemoteKey(buffer, id);
+        };
         int selected = -1;
         // Consecutive hits in the same offset-independent MR (typical GPU
         // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
         // is a failover walk and must re-run selectDevice.
-        if (allow_device_reuse && retry_count == 0 && hint_device_id >= 0 &&
-            buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
-            const size_t nkeys =
-                by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
-            if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
-                selected = hint_device_id;
-            }
+        if (allow_device_reuse && retry_count == 0 && hint.empty() &&
+            buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0 &&
+            eligible(hint_device_id)) {
+            selected = hint_device_id;
         }
         if (selected < 0) {
             selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
                                           retry_count, by_local_hca);
         }
-        if (selected < 0) return false;
+        if (!eligible(selected)) {
+            // A named NIC override must not silently move to another rail.
+            // Automatic selection walks topology candidates, not arbitrary
+            // nonzero key slots (peer-affinity constraints still apply).
+            if (!hint.empty()) return false;
+            const size_t count = desc->topology.getHcaList().size();
+            selected = -1;
+            for (size_t i = 0; i < count; ++i) {
+                const int attempt =
+                    1 +
+                    (static_cast<size_t>(std::max(0, retry_count - 1)) + i) %
+                        count;
+                const int id =
+                    pickTopologyDevice(desc, buffer, offset, hint, local_hca,
+                                       attempt, by_local_hca);
+                if (eligible(id)) {
+                    selected = id;
+                    break;
+                }
+            }
+            if (selected < 0) return false;
+        }
         buffer_id = candidate;
         device_id = selected;
         return true;
@@ -1497,7 +1528,17 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 int hint_buffer_id, int hint_device_id) {
     return selectDeviceImpl(desc, offset, length, hint, {}, false, buffer_id,
                             device_id, retry_count, hint_buffer_id,
-                            hint_device_id);
+                            hint_device_id, KeyRole::Remote);
+}
+
+int RdmaTransport::selectLocalDevice(SegmentDesc *desc, uint64_t offset,
+                                     size_t length, std::string_view hint,
+                                     int &buffer_id, int &device_id,
+                                     int retry_count, int hint_buffer_id,
+                                     int hint_device_id) {
+    return selectDeviceImpl(desc, offset, length, hint, {}, false, buffer_id,
+                            device_id, retry_count, hint_buffer_id,
+                            hint_device_id, KeyRole::Local, &context_list_);
 }
 
 int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
@@ -1508,7 +1549,7 @@ int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                           int hint_device_id) {
     return selectDeviceImpl(desc, offset, length, {}, local_hca, true,
                             buffer_id, device_id, retry_count, hint_buffer_id,
-                            hint_device_id);
+                            hint_device_id, KeyRole::Remote);
 }
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,

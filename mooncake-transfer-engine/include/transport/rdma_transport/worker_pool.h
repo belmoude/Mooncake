@@ -47,6 +47,13 @@ class WorkerPool {
    private:
     using SliceList = std::vector<Transport::Slice *>;
 
+    static int selectPeerDevice(Transport::SegmentDesc *peer_segment_desc,
+                                uint64_t offset, size_t length,
+                                const std::string &local_hca, int &buffer_id,
+                                int &device_id, int retry_count = 0,
+                                int hint_buffer_id = -1,
+                                int hint_device_id = -1);
+
     // Enqueue slices that were prepared by another WorkerPool. Used for
     // local-NIC failure handoff: the original worker keeps the remote path
     // fixed, updates the local lkey, and pushes the slice to this context's
