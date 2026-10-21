@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -80,9 +81,20 @@ namespace mooncake {
 
 class WorkerPoolTestPeer {
    public:
+    static void redispatch(WorkerPool &pool, Transport::Slice *slice) {
+        std::vector<Transport::Slice *> slices{slice};
+        pool.redispatch(slices, 0);
+    }
+
     static void markRailFailed(WorkerPool &pool, const std::string &path,
                                bool immediate_pause) {
         pool.markRailFailed(path, immediate_pause);
+    }
+
+    static bool hasAvailableAlternative(WorkerPool &pool,
+                                        Transport::Slice *slice,
+                                        const std::string &failed_path) {
+        return pool.hasAvailablePeerRailAlternative(slice, failed_path);
     }
 
     static bool isRailAvailable(WorkerPool &pool, const std::string &path) {
@@ -182,12 +194,33 @@ namespace {
 constexpr const char *kPeerA = "10.0.0.1@mlx5_bond_0";
 constexpr const char *kPeerB = "10.0.0.1@mlx5_bond_1";
 
+Transport::SegmentDesc makeAffinityPeerDesc() {
+    Transport::SegmentDesc desc;
+    desc.name = "affinity-peer";
+    desc.protocol = "rdma";
+    EXPECT_EQ(desc.topology.parse(R"({"cpu:0":[["nic1","unused"],[]]})"), 0);
+    for (const auto &name : desc.topology.getHcaList())
+        desc.devices.push_back({name, 0, "", ""});
+    Transport::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x1000;
+    buffer.length = 4096;
+    for (size_t i = 0; i < desc.devices.size(); ++i) {
+        buffer.lkey.push_back(101 + i);
+        buffer.rkey.push_back(11 + i);
+    }
+    desc.buffers.push_back(buffer);
+    return desc;
+}
+
 class WorkerPoolRailStateTest : public ::testing::Test {
    protected:
     void SetUp() override {
         // The context below is expected to fail to open, and that path is
         // noisy. Silence it so gtest failures stay readable.
         previous_min_log_level_ = FLAGS_minloglevel;
+        previous_dest_affinity_ = globalConfig().enable_dest_device_affinity;
+        previous_peer_affinity_ = globalConfig().enable_hca_peer_affinity;
         FLAGS_minloglevel = google::GLOG_FATAL;
 
         metadata_ = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
@@ -211,6 +244,8 @@ class WorkerPoolRailStateTest : public ::testing::Test {
         context_.reset();
         transport_.reset();
         FLAGS_minloglevel = previous_min_log_level_;
+        globalConfig().enable_dest_device_affinity = previous_dest_affinity_;
+        globalConfig().enable_hca_peer_affinity = previous_peer_affinity_;
     }
 
     void failRail(const std::string &path, bool immediate_pause = false) {
@@ -222,12 +257,112 @@ class WorkerPoolRailStateTest : public ::testing::Test {
         return WorkerPoolTestPeer::isRailAvailable(*worker_pool_, path);
     }
 
+    uint32_t selectedPeerKey(Transport::SegmentDesc desc, int retry_count = 0,
+                             uint64_t addr = 0x1000) {
+        auto peer = std::make_shared<Transport::SegmentDesc>(std::move(desc));
+        EXPECT_EQ(metadata_->addLocalSegment(LOCAL_SEGMENT_ID, peer->name,
+                                             std::move(peer)),
+                  0);
+        peer = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        // Paused rails stop redispatch before endpoint or device I/O.
+        // LOCAL_SEGMENT_ID also keeps metadata refreshes in memory.
+        for (size_t i = 0; i < peer->devices.size(); ++i)
+            failRail(peer->internedNicPath(i), true);
+        Transport::TransferTask task;
+        task.batch_id = transport_->allocateBatchID(1);
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.target_id = LOCAL_SEGMENT_ID;
+        slice.rdma.dest_addr = addr;
+        slice.rdma.retry_cnt = retry_count;
+        slice.rdma.max_retry_cnt = retry_count + 1;
+        slice.length = 16;
+        WorkerPoolTestPeer::redispatch(*worker_pool_, &slice);
+        EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+        EXPECT_EQ(task.failed_slice_count, 1);
+        EXPECT_TRUE(transport_->freeBatchID(task.batch_id).ok());
+        return slice.rdma.dest_rkey;
+    }
+
     int previous_min_log_level_ = 0;
+    bool previous_dest_affinity_ = false;
+    bool previous_peer_affinity_ = false;
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<RdmaTransport> transport_;
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
+
+TEST_F(WorkerPoolRailStateTest, DestinationAffinityKeepsNamedNicOnRetries) {
+    globalConfig().enable_dest_device_affinity = true;
+    globalConfig().enable_hca_peer_affinity = false;
+    auto desc = makeAffinityPeerDesc();
+    const int named = desc.topology.getDeviceIndex("*", "unused");
+    for (int retry : {0, 1, 2, 5})
+        EXPECT_EQ(selectedPeerKey(desc, retry), desc.buffers[0].rkey[named]);
+}
+
+TEST_F(WorkerPoolRailStateTest, DestinationAffinityRejectsZeroKeyOnNamedNic) {
+    globalConfig().enable_dest_device_affinity = true;
+    globalConfig().enable_hca_peer_affinity = false;
+    auto desc = makeAffinityPeerDesc();
+    const int named = desc.topology.getDeviceIndex("*", "unused");
+    const int other = desc.topology.getDeviceIndex("*", "nic1");
+    desc.buffers[0].lkey[named] = 0;
+    desc.buffers[0].rkey[named] = 0;
+    for (int retry : {0, 1, 2, 5}) EXPECT_EQ(selectedPeerKey(desc, retry), 0);
+
+    globalConfig().enable_dest_device_affinity = false;
+    EXPECT_EQ(selectedPeerKey(desc), desc.buffers[0].rkey[other]);
+}
+
+TEST_F(WorkerPoolRailStateTest, LocalOnlyBufferCannotBeSelectedAsRemoteTarget) {
+    auto desc = makeAffinityPeerDesc();
+    desc.buffers[0].rkey.clear();
+    int buffer_id = -1, device_id = -1;
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1000, 16, buffer_id, device_id),
+        0);
+    EXPECT_EQ(selectedPeerKey(desc), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, ZeroKeyIsNotAnAlternativePeerRail) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "sparse-peer";
+    desc->protocol = "rdma";
+    // nic1 is outside cpu:0's topology entry, but legacy failover can use it
+    // when this buffer has an actual MR on that device.
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0":[["nic0"],[]],)"
+                                   R"("cpu:1":[["nic1"],[]]})"),
+              0);
+    for (const auto &name : desc->topology.getHcaList())
+        desc->devices.push_back({name, 0, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x1000;
+    buffer.length = 4096;
+    buffer.rkey.assign(2, 0);
+    const int first = desc->topology.getDeviceIndex("*", "nic0");
+    const int second = desc->topology.getDeviceIndex("*", "nic1");
+    buffer.rkey[first] = 11;
+    buffer.lkey = buffer.rkey;
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(metadata_->addLocalSegment(77, "sparse-peer", desc), 0);
+    Transport::Slice slice{};
+    slice.target_id = 77;
+    slice.rdma.dest_addr = 0x1000;
+    slice.length = 16;
+    const std::string path = desc->internedNicPath(first);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+    desc->buffers[0].lkey[second] = 22;
+    desc->buffers[0].rkey[second] = 22;
+    EXPECT_TRUE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                            &slice, path));
+    failRail(desc->internedNicPath(second), true);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+}
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));

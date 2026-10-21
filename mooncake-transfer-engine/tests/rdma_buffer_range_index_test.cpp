@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -260,6 +261,45 @@ TEST(BufferRangeIndex, LastHitReusesHintDevice) {
         0);
     EXPECT_EQ(hinted_buffer, 0);
     EXPECT_EQ(hinted_device, first_device);
+}
+
+TEST(BufferRangeIndex, LastHitReusesRegisteredDeviceWithNamedHint) {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    ASSERT_EQ(desc.topology.parse(R"({"cpu:0":[["mlx5_0","mlx5_1"],[]]})"), 0);
+    desc.buffers[0].lkey = {1, 2};
+    desc.buffers[0].rkey = {3, 4};
+    const int cached_device = desc.topology.getDeviceIndex("*", "mlx5_1");
+    int buffer_id = -1, device_id = -1;
+    // A paused named rail can leave a registered alternative in the cache.
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1080, 16, "mlx5_0", buffer_id,
+                                    device_id, 0, 0, cached_device),
+        0);
+    EXPECT_EQ(device_id, cached_device);
+}
+
+TEST(BufferRangeIndex, LocalOnlyLastHitRetainsRoundRobinSelection) {
+    const char *previous = std::getenv("MC_PATH_ROUNDROBIN");
+    const bool was_set = previous != nullptr;
+    const std::string previous_value = previous ? previous : "";
+    ASSERT_EQ(::setenv("MC_PATH_ROUNDROBIN", "1", 1), 0);
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    if (was_set)
+        ASSERT_EQ(::setenv("MC_PATH_ROUNDROBIN", previous_value.c_str(), 1), 0);
+    else
+        ASSERT_EQ(::unsetenv("MC_PATH_ROUNDROBIN"), 0);
+    ASSERT_EQ(desc.topology.parse(R"({"cpu:0":[["mlx5_0","mlx5_1"],[]]})"), 0);
+    desc.buffers[0].lkey = {1, 2};
+    desc.buffers[0].rkey.clear();
+    int buffer_id = -1, device_id = -1;
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id, device_id),
+        0);
+    const int first_device = device_id;
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1100, 16, buffer_id,
+                                          device_id, 0, 0, first_device),
+              0);
+    EXPECT_NE(device_id, first_device);
 }
 
 TEST(BufferRangeIndex, DeviceHintDoesNotFollowBufferJump) {
