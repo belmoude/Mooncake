@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -47,6 +48,14 @@ class RdmaTransportTestPeer {
     static void bindTopology(RdmaTransport &transport,
                              std::shared_ptr<Topology> topology) {
         transport.local_topology_ = std::move(topology);
+    }
+
+    static void initializeLocalNicMap(RdmaTransport &transport) {
+        std::vector<std::string> context_names;
+        for (const auto &context : transport.context_list_)
+            context_names.push_back(context->deviceName());
+        transport.local_nic_map_ = RdmaTransport::buildLocalNicMap(
+            transport.local_topology_->getMatrix(), context_names);
     }
 
     // Drives the device-initialization loop directly so tests can assert on

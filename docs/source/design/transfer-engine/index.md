@@ -69,6 +69,45 @@ RDMA device selection requires a valid key for each buffer on the selected
 HCA, including cached selections, hints and retries. Some contexts may have no
 MR for a buffer, for example due to Data Direct pairing.
 
+(rdma-gpu-registration-policy)=
+### GPU Memory Registration Policy
+
+The classic `rdma` and `rdma_twosided` transports can register GPU device memory
+only on its topology location's active preferred HCAs:
+
+```bash
+MC_RDMA_NIC_SELECTION=local python app.py
+```
+
+The default, `all`, retains the existing registration behavior. Invalid values
+produce a warning and use `all`. Set the variable before starting the C++ or
+Python program: it is read once when process-wide configuration is first loaded.
+Existing initialization and memory registration interfaces are unchanged; other
+transports are unaffected.
+
+`local` uses a topology snapshot taken at transport installation.
+Each RDMA transport caches location-to-preferred-context indices, not MRs or
+keys. Every registration checks those contexts' current active state. Updating
+the shared topology after installation does not refresh this cache.
+
+CPU, pinned host, managed and unclassified memory retain the existing full
+registration path. GPU memory also uses that path if its location has no active
+preferred HCA. There is no intermediate fallback to the topology's `avail` set.
+Registration failure on a selected HCA rolls back and returns an error without
+expanding the registration set. Device filtering and Data Direct rules still
+apply.
+
+With `local`, the existing `getMemoryLocation()` runs before registration to
+identify GPU memory, so host memory may incur an additional NUMA query and its
+existing logs. This early host result is not used for final metadata; wildcard
+host locations are resolved again after registration. `all` adds no early query.
+
+Enable `local` only when every RDMA peer accessing these buffers has the
+sparse-key selection checks. The metadata format is unchanged, but older readers
+may select an unregistered HCA. Selective registration reduces the available
+failover paths; runtime failover uses existing valid MR keys without adding
+registrations.
+
 ### Endpoint Management
 Mooncake Store employs a pair of endpoints to represent the connection between a local RDMA
 NIC and a remote RDMA NIC. In practice, each endpoint
@@ -505,6 +544,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
 - `MC_MAX_CONCURRENT_REG_MR` Cap how many buffers the EFA and RDMA transports process concurrently in `registerLocalMemoryBatch` and `unregisterLocalMemoryBatch`. The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
+- `MC_RDMA_NIC_SELECTION` Select `all` (default) or `local` GPU memory registration for the classic `rdma` and `rdma_twosided` transports. See {ref}`rdma-gpu-registration-policy`.
 - `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `all` (the default) registers every buffer on every NIC. `local` restricts **device** memory to the NICs the topology reports as closest to that GPU, which on p5.48xlarge is the 4 EFA devices sharing the GPU's PCIe root complex. Because EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, narrowing the NIC set cuts registration time by close to the fan-out ratio. Set it when registering many GPU buffers is a startup bottleneck; it is opt-in because fewer NICs can serve a transfer touching that buffer, so a job whose working set sits behind a single GPU is capped at that rail group's bandwidth rather than the node's. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
 - `MC_EFA_CQ_THREADS` Cap on the number of CQ polling threads in the EFA transport, default value 1 (which already reaches ~99.9% of peak throughput). Pollers busy-wait, so each extra thread costs a full core. Set 0 to lift the cap (one poller per EFA device). Values above the device count are ignored
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.

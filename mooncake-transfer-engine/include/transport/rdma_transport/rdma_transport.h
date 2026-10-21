@@ -132,6 +132,10 @@ class RdmaTransport : public Transport {
     }
 
    private:
+    static std::unordered_map<std::string, std::vector<size_t>>
+    buildLocalNicMap(const TopologyMatrix &matrix,
+                     const std::vector<std::string> &device_names);
+
     int initializeRdmaResources();
 
     int startHandshakeDaemon(std::string &local_server_name);
@@ -162,6 +166,10 @@ class RdmaTransport : public Transport {
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
     std::shared_ptr<Topology> local_topology_;
+    // Location -> preferred context indices, built once after initialization.
+    // Registration still checks active(); later topology changes are not
+    // reflected in this per-transport snapshot.
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
     // "192.168.0.y:port") for NIC path construction, while

@@ -349,6 +349,33 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     }
 
     std::string resolved_name = name;
+    // Use only device locations before registration.
+    // Host pages may not be pinned yet; resolve their final location below.
+    std::string device_location;
+    if (globalConfig().rdma_nic_selection == RdmaNicSelection::LOCAL) {
+        const auto entries = getMemoryLocation(addr, length, true);
+        // The query returns a device location, cpu:N, or the wildcard.
+        if (!entries.empty() && entries[0].location != kWildcardLocation &&
+            entries[0].location.rfind("cpu:", 0) != 0)
+            device_location = entries[0].location;
+    }
+    std::vector<bool> selected(context_list_.size(), true);
+    if (!device_location.empty()) {
+        if (name == kWildcardLocation) resolved_name = device_location;
+        std::vector<bool> preferred(context_list_.size(), false);
+        auto entry = local_nic_map_.find(resolved_name);
+        if (entry != local_nic_map_.end()) {
+            for (size_t i : entry->second)
+                preferred[i] = context_list_[i]->active();
+        }
+        if (std::any_of(preferred.begin(), preferred.end(),
+                        [](bool value) { return value; })) {
+            selected = std::move(preferred);
+        } else {
+            VLOG(1) << "No active preferred HCA for " << resolved_name
+                    << "; using the existing full registration path";
+        }
+    }
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -507,7 +534,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // block, so skip it there.
     const bool do_pre_touch =
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
-        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        context_list_.size() > 0 && selected[0] &&
+        std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
@@ -553,6 +581,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             const int ar = access_rights;  // Local copy for lambda capture
 
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!selected[i]) continue;
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
@@ -576,6 +605,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             }
         } else {
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!selected[i]) continue;
                 int ret = context_list_[i]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
@@ -608,17 +638,20 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         // Registration faults in untouched host pages. Resolve the original
         // buffer's first page only after it has been pinned, or NUMA discovery
         // can retain "*" and select NICs on unrelated NUMA nodes.
-        if (ci == 0 && name == kWildcardLocation) {
+        if (ci == 0 && name == kWildcardLocation && device_location.empty()) {
             const auto entries = getMemoryLocation(addr, length, true);
             resolved_name = entries[0].location;
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            auto &context = context_list_[i];
+            buffer_desc.lkey.push_back(selected[i] ? context->lkey(chunk_addr)
+                                                   : 0);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+                buffer_desc.rkey.push_back(
+                    selected[i] ? context->rkey(chunk_addr) : 0);
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -1342,6 +1375,26 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     return ret;
 }
 
+std::unordered_map<std::string, std::vector<size_t>>
+RdmaTransport::buildLocalNicMap(const TopologyMatrix &matrix,
+                                const std::vector<std::string> &device_names) {
+    std::unordered_map<std::string, size_t> name_to_index;
+    for (size_t i = 0; i < device_names.size(); ++i)
+        name_to_index[device_names[i]] = i;
+
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map;
+    for (const auto &entry : matrix) {
+        std::vector<size_t> indices;
+        for (const auto &hca : entry.second.preferred_hca) {
+            auto it = name_to_index.find(hca);
+            if (it != name_to_index.end()) indices.push_back(it->second);
+        }
+        // A missing entry retains the original full registration path.
+        if (!indices.empty()) local_nic_map[entry.first] = std::move(indices);
+    }
+    return local_nic_map;
+}
+
 int RdmaTransport::initializeRdmaResources() {
     auto hca_list = local_topology_->getHcaList();
     for (auto &device_name : hca_list) {
@@ -1377,6 +1430,17 @@ int RdmaTransport::initializeRdmaResources() {
     if (local_topology_->empty()) {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
+    }
+
+    // Cache preferred HCA context indices after resource initialization has
+    // excluded devices that could not be opened.
+    if (globalConfig().rdma_nic_selection == RdmaNicSelection::LOCAL) {
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (const auto &context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ =
+            buildLocalNicMap(local_topology_->getMatrix(), context_names);
     }
     return 0;
 }

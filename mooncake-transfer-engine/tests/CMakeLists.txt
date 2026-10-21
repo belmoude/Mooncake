@@ -496,13 +496,16 @@ target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
-# Run production registration/chunk/selector code with verbs and NUMA stubs. Use
-# a static library so the test supplies the verbs registration symbols.
+# Run the real registration/chunk/selector code with verbs and pointer
+# classification stubs; no GPU or RDMA device is required. GNU --wrap must see
+# the production references at link time, so use a static-library build.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
   add_executable(rdma_registration_policy_test
                  ${WORKSPACE}/rdma_registration_policy_test.cpp)
   target_link_libraries(rdma_registration_policy_test PUBLIC transfer_engine
                                                              gtest gtest_main)
+  target_link_options(rdma_registration_policy_test PRIVATE
+                      "-Wl,--wrap=_ZN8mooncake17getMemoryLocationEPvmb")
   add_test(NAME rdma_registration_policy_test
            COMMAND rdma_registration_policy_test)
 endif()

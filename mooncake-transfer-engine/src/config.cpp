@@ -695,6 +695,19 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* rdma_nic_selection = std::getenv("MC_RDMA_NIC_SELECTION");
+    if (rdma_nic_selection) {
+        if (strcasecmp(rdma_nic_selection, "all") == 0) {
+            config.rdma_nic_selection = RdmaNicSelection::ALL;
+        } else if (strcasecmp(rdma_nic_selection, "local") == 0) {
+            config.rdma_nic_selection = RdmaNicSelection::LOCAL;
+        } else {
+            LOG(WARNING) << "Invalid MC_RDMA_NIC_SELECTION environment value: "
+                         << rdma_nic_selection
+                         << ", expected all|local, keeping default";
+        }
+    }
+
     if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
         const auto parsed = TryParseInteger<int>(
             value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
@@ -894,6 +907,9 @@ void dumpGlobalConfig() {
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");
+    LOG(INFO) << "rdma_nic_selection = "
+              << (config.rdma_nic_selection == RdmaNicSelection::LOCAL ? "local"
+                                                                       : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "

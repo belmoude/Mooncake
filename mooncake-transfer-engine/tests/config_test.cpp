@@ -528,6 +528,59 @@ TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
 }
 
+class RdmaNicSelectionEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_RDMA_NIC_SELECTION"); }
+};
+
+TEST_F(RdmaNicSelectionEnvTest, DefaultsToAll) {
+    ::unsetenv("MC_RDMA_NIC_SELECTION");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::ALL);
+}
+
+TEST_F(RdmaNicSelectionEnvTest, LocalIsApplied) {
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "local", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::LOCAL);
+}
+
+TEST_F(RdmaNicSelectionEnvTest, AllIsAcceptedExplicitly) {
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "all", 1), 0);
+    GlobalConfig config;
+    config.rdma_nic_selection = RdmaNicSelection::LOCAL;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::ALL);
+}
+
+TEST_F(RdmaNicSelectionEnvTest, CaseIsIgnored) {
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "LoCaL", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::LOCAL);
+
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "ALL", 1), 0);
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::ALL);
+}
+
+TEST_F(RdmaNicSelectionEnvTest, UnknownValueKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "topology", 1), 0);
+    GlobalConfig config;
+    config.rdma_nic_selection = RdmaNicSelection::LOCAL;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::LOCAL);
+}
+
+TEST_F(RdmaNicSelectionEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, RdmaNicSelection::ALL);
+}
+
 // max_wr_from_env distinguishes "the operator asked for this depth" from "this
 // is the compiled-in default".  The EFA transport needs that distinction: with
 // no override it adopts the provider's per-device transmit queue depth, which
