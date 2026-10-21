@@ -333,14 +333,14 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        bool remote_accessible,
                                        bool update_metadata) {
     return registerLocalMemoryInternal(addr, length, name, remote_accessible,
-                                       update_metadata, false);
+                                       update_metadata, false,
+                                       default_registration_policy_);
 }
 
-int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
-                                               const std::string &name,
-                                               bool remote_accessible,
-                                               bool update_metadata,
-                                               bool force_sequential) {
+int RdmaTransport::registerLocalMemoryInternal(
+    void *addr, size_t length, const std::string &name, bool remote_accessible,
+    bool update_metadata, bool force_sequential,
+    RdmaRegistrationPolicy effective_policy) {
     int access_rights = IBV_ACCESS_LOCAL_WRITE;
     if (remote_accessible)
         access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -349,6 +349,24 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     }
 
     std::string resolved_name = name;
+    // Probe the original pointer, before any peermem/dma-buf mapping. Never
+    // resolve CPU NUMA placement here: registration must fault pages in first.
+    const std::string device_location =
+        effective_policy == RdmaRegistrationPolicy::TopologyLocal
+            ? getDeviceMemoryLocation(addr)
+            : std::string{};
+    std::vector<bool> selected(context_list_.size(), true);
+    if (!device_location.empty()) {
+        if (name == kWildcardLocation) resolved_name = device_location;
+        auto preferred = selectRegistrationContexts(resolved_name);
+        if (std::any_of(preferred.begin(), preferred.end(),
+                        [](bool value) { return value; })) {
+            selected = std::move(preferred);
+        } else {
+            VLOG(1) << "No active preferred HCA for " << resolved_name
+                    << "; using the existing full registration path";
+        }
+    }
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -506,6 +524,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
     // block, so skip it there.
     const bool do_pre_touch =
+        device_location.empty() &&
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
@@ -553,6 +572,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             const int ar = access_rights;  // Local copy for lambda capture
 
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!selected[i]) continue;
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
@@ -576,6 +596,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             }
         } else {
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!selected[i]) continue;
                 int ret = context_list_[i]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
@@ -608,17 +629,20 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         // Registration faults in untouched host pages. Resolve the original
         // buffer's first page only after it has been pinned, or NUMA discovery
         // can retain "*" and select NICs on unrelated NUMA nodes.
-        if (ci == 0 && name == kWildcardLocation) {
+        if (ci == 0 && name == kWildcardLocation && device_location.empty()) {
             const auto entries = getMemoryLocation(addr, length, true);
             resolved_name = entries[0].location;
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            auto &context = context_list_[i];
+            buffer_desc.lkey.push_back(selected[i] ? context->lkey(chunk_addr)
+                                                   : 0);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+                buffer_desc.rkey.push_back(
+                    selected[i] ? context->rkey(chunk_addr) : 0);
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -851,11 +875,13 @@ int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
+    const auto effective_policy = default_registration_policy_;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     if (!globalConfig().with_nvidia_peermem) {
         for (auto &buffer : buffer_list) {
-            int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                          true, false);
+            int ret = registerLocalMemoryInternal(buffer.addr, buffer.length,
+                                                  location, true, false, false,
+                                                  effective_policy);
             if (ret) {
                 LOG(WARNING)
                     << "RdmaTransport: Failed to register memory: addr "
@@ -866,11 +892,11 @@ int RdmaTransport::registerLocalMemoryBatch(
     } else {
 #endif
         auto start = std::chrono::steady_clock::now();
-        int first_error =
-            runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
+        int first_error = runBoundedRegMrBatch(
+            buffer_list.size(), [&, effective_policy](size_t i) {
                 int ret = registerLocalMemoryInternal(
                     buffer_list[i].addr, buffer_list[i].length, location, true,
-                    false, true);
+                    false, true, effective_policy);
                 if (ret) {
                     LOG(WARNING)
                         << "RdmaTransport: Failed to register memory: addr "
@@ -1372,7 +1398,37 @@ int RdmaTransport::initializeRdmaResources() {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
+    initializePreferredDevices();
     return 0;
+}
+
+void RdmaTransport::initializePreferredDevices() {
+    preferred_devices_.clear();
+    if (!local_topology_) return;
+    for (const auto &[location, entry] : local_topology_->getMatrix()) {
+        auto &indices = preferred_devices_[location];
+        // Context ordering is the key-array ordering, including placeholders.
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            if (std::find(entry.preferred_hca.begin(),
+                          entry.preferred_hca.end(),
+                          context_list_[i]->deviceName()) !=
+                entry.preferred_hca.end())
+                indices.push_back(i);
+        }
+    }
+}
+
+std::vector<bool> RdmaTransport::selectRegistrationContexts(
+    const std::string &location) const {
+    std::vector<bool> selected(context_list_.size(), false);
+    auto it = preferred_devices_.find(location);
+    if (it != preferred_devices_.end()) {
+        for (size_t i : it->second) {
+            if (i < context_list_.size() && context_list_[i]->active())
+                selected[i] = true;
+        }
+    }
+    return selected;
 }
 
 int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {

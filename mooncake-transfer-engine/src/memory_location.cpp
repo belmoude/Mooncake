@@ -82,6 +82,31 @@ static bool detectCudaDevicePresent() {
 }
 #endif
 
+std::string getDeviceMemoryLocation(void *addr) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    static const bool device_present = detectCudaDevicePresent();
+    if (device_present) {
+        cudaPointerAttributes attributes{};
+        if (cudaPointerGetAttributes(&attributes, addr) != cudaSuccess) {
+#if !defined(USE_SUNRISE)
+            // Ordinary host pointers can be rejected by older GPU runtimes.
+            // Do not leave the classification error pending for the caller.
+            (void)cudaGetLastError();
+#endif
+            return {};
+        }
+        if (attributes.type == cudaMemoryTypeDevice && attributes.device >= 0) {
+            return genGpuNodeName(attributes.device);
+        }
+    }
+#else
+    (void)addr;
+#endif
+    return {};
+}
+
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len,
                                                          bool only_first_page) {

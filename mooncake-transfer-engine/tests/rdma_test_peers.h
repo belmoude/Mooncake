@@ -49,6 +49,15 @@ class RdmaTransportTestPeer {
         transport.local_topology_ = std::move(topology);
     }
 
+    static void setRegistrationPolicy(RdmaTransport &transport,
+                                      RdmaRegistrationPolicy policy) {
+        transport.default_registration_policy_ = policy;
+    }
+
+    static void initializePreferredDevices(RdmaTransport &transport) {
+        transport.initializePreferredDevices();
+    }
+
     static int selectLocalDevice(RdmaTransport &transport,
                                  RdmaTransport::SegmentDesc *desc,
                                  uint64_t addr, size_t length, int &buffer_id,
