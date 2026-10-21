@@ -117,6 +117,8 @@ class TransferEngineImpl {
              const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
+    int setRdmaRegistrationPolicy(RdmaRegistrationPolicy policy);
+
     int freeEngine();
 
     // Only for testing.
@@ -501,6 +503,9 @@ class TransferEngineImpl {
 
     void eraseMemoryRegionLocked(void* addr);
 
+    RdmaRegistrationPolicy rdma_registration_policy_ =
+        RdmaRegistrationPolicy::All;
+    bool init_started_ = false;
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;

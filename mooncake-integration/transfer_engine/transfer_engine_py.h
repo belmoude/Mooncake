@@ -65,6 +65,16 @@ class TransferEnginePy {
                       const char *protocol, const char *device_name,
                       const char *metadata_type);
 
+    int initializeWithRdmaPolicy(const char *local_hostname,
+                                 const char *metadata_server,
+                                 const char *protocol, const char *device_name,
+                                 const std::string &rdma_registration_policy);
+
+    int initializeExtWithRdmaPolicy(
+        const char *local_hostname, const char *metadata_server,
+        const char *protocol, const char *device_name,
+        const char *metadata_type, const std::string &rdma_registration_policy);
+
     int getRpcPort();
 
     uintptr_t allocateManagedBuffer(size_t length);

@@ -49,6 +49,15 @@ class RdmaTransportTestPeer {
         transport.local_topology_ = std::move(topology);
     }
 
+    static void setRegistrationPolicy(RdmaTransport &transport,
+                                      RdmaRegistrationPolicy policy) {
+        transport.default_registration_policy_ = policy;
+    }
+
+    static void initializePreferredDevices(RdmaTransport &transport) {
+        transport.initializePreferredDevices();
+    }
+
     // Drives the device-initialization loop directly so tests can assert on
     // the resulting context_list_ layout without a full install().
     static int initializeResources(RdmaTransport &transport) {

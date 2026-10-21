@@ -47,6 +47,7 @@ class RdmaTransport : public Transport {
     friend class RdmaTransportTestPeer;
     friend class RdmaNotificationTestPeer;
     friend class WorkerPool;
+    friend class MultiTransport;
 
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
@@ -88,8 +89,8 @@ class RdmaTransport : public Transport {
     int registerLocalMemoryInternal(void *addr, size_t length,
                                     const std::string &location,
                                     bool remote_accessible,
-                                    bool update_metadata,
-                                    bool force_sequential);
+                                    bool update_metadata, bool force_sequential,
+                                    RdmaRegistrationPolicy effective_policy);
 
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
                                       bool force_sequential);
@@ -158,6 +159,13 @@ class RdmaTransport : public Transport {
     }
 
    private:
+    void initializePreferredDevices();
+    std::vector<bool> selectRegistrationContexts(
+        const std::string &location) const;
+
+    RdmaRegistrationPolicy default_registration_policy_ =
+        RdmaRegistrationPolicy::All;
+    std::unordered_map<std::string, std::vector<size_t>> preferred_devices_;
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;

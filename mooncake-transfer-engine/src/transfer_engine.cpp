@@ -1909,4 +1909,17 @@ Status TransferEngine::transferScatter(
     return operation.wait();
 }
 
+int TransferEngine::setRdmaRegistrationPolicy(RdmaRegistrationPolicy policy) {
+    if (policy != RdmaRegistrationPolicy::All &&
+        policy != RdmaRegistrationPolicy::TopologyLocal)
+        return ERR_INVALID_ARGUMENT;
+    if (use_tent_) {
+        if (policy == RdmaRegistrationPolicy::All) return 0;
+        LOG(ERROR)
+            << "Topology-local RDMA registration is not supported by TENT";
+        return ERR_NOT_IMPLEMENTED;
+    }
+    return impl_ ? impl_->setRdmaRegistrationPolicy(policy)
+                 : ERR_INVALID_ARGUMENT;
+}
 }  // namespace mooncake

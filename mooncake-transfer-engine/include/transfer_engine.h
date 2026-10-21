@@ -128,6 +128,10 @@ class TransferEngine {
              const std::string& ip_or_host_name, uint64_t rpc_port,
              const std::string& protocol);
 
+    // Configure before init(). The default is All. Not supported by TENT
+    // except for the no-op All policy. Configuration is not thread-safe.
+    int setRdmaRegistrationPolicy(RdmaRegistrationPolicy policy);
+
     int freeEngine();
 
     Transport* installTransport(const std::string& proto, void** args);

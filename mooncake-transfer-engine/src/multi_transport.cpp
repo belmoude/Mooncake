@@ -566,6 +566,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
+    return installTransport(proto, std::move(topo),
+                            RdmaRegistrationPolicy::All);
+}
+
+Transport* MultiTransport::installTransport(const std::string& proto,
+                                            std::shared_ptr<Topology> topo,
+                                            RdmaRegistrationPolicy policy) {
 #ifdef USE_NCCL_HOST
     if ((proto == "nccl" && !transport_map_.empty()) ||
         (proto != "nccl" && transport_map_.count("nccl") != 0)) {
@@ -587,6 +594,8 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         } else {
             transport = new RdmaTwoSidedTransport();
         }
+        static_cast<RdmaTransport*>(transport)->default_registration_policy_ =
+            policy;
     }
 #ifdef USE_UB
     else if (std::string(proto) == "ub") {

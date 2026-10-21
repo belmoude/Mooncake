@@ -38,6 +38,11 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len,
                                                          bool only_first_page);
 
+// Classify only device memory, without touching host pages or querying NUMA.
+// Returns an empty string for host/managed/unknown memory or without GPU
+// support.
+std::string getDeviceMemoryLocation(void *addr);
+
 // Returns the kernel page size backing the VMA containing addr.
 size_t detectBufferPageSize(void *addr);
 
