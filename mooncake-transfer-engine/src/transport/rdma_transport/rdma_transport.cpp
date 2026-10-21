@@ -1088,7 +1088,11 @@ Status RdmaTransport::submitTransferTask(
             bool found_device = false;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
-                if (request_context && request_context->active()) {
+                const auto &lkeys =
+                    local_segment_desc->buffers[request_buffer_id].lkey;
+                if (request_context && request_context->active() &&
+                    static_cast<size_t>(request_device_id) < lkeys.size() &&
+                    lkeys[request_device_id] != 0) {
                     found_device = true;
                     buffer_id = request_buffer_id;
                     device_id = request_device_id;
@@ -1120,8 +1124,11 @@ Status RdmaTransport::submitTransferTask(
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
-                       context_list_.size());
+                const auto &lkeys = local_segment_desc->buffers[buffer_id].lkey;
+                if (static_cast<size_t>(device_id) >= lkeys.size() ||
+                    lkeys[device_id] == 0)
+                    continue;
+                assert(lkeys.size() == context_list_.size());
                 found_device = true;
                 last_local_buffer_id = buffer_id;
                 last_local_device_id = device_id;
@@ -1451,25 +1458,57 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             !bufferCoversRange(buffer.addr, buffer.length, offset, length)) {
             return false;
         }
+        auto eligible = [&](int id) {
+            if (id < 0 || (!desc->devices.empty() &&
+                           static_cast<size_t>(id) >= desc->devices.size()))
+                return false;
+            // A local-only MR has no rkey array. Otherwise both arrays
+            // describe the same per-context registration mask.
+            if (!buffer.lkey.empty() &&
+                (static_cast<size_t>(id) >= buffer.lkey.size() ||
+                 buffer.lkey[id] == 0))
+                return false;
+            if (!buffer.rkey.empty() &&
+                (static_cast<size_t>(id) >= buffer.rkey.size() ||
+                 buffer.rkey[id] == 0))
+                return false;
+            return !buffer.lkey.empty() || !buffer.rkey.empty();
+        };
         int selected = -1;
         // Consecutive hits in the same offset-independent MR (typical GPU
         // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
         // is a failover walk and must re-run selectDevice.
-        if (allow_device_reuse && retry_count == 0 && hint_device_id >= 0 &&
-            buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
-            const size_t nkeys =
-                by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
-            if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
-                selected = hint_device_id;
-            }
+        if (allow_device_reuse && retry_count == 0 && hint.empty() &&
+            buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0 &&
+            eligible(hint_device_id)) {
+            selected = hint_device_id;
         }
         if (selected < 0) {
             selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
                                           retry_count, by_local_hca);
         }
-        if (selected < 0) return false;
+        if (!eligible(selected)) {
+            // A named NIC override must not silently move to another rail.
+            // Automatic selection walks topology candidates, not arbitrary
+            // nonzero key slots (peer-affinity constraints still apply).
+            if (!hint.empty()) return false;
+            const size_t count = desc->topology.getHcaList().size();
+            selected = -1;
+            for (size_t i = 0; i < count; ++i) {
+                const int attempt =
+                    1 +
+                    (static_cast<size_t>(std::max(0, retry_count - 1)) + i) %
+                        count;
+                const int id =
+                    pickTopologyDevice(desc, buffer, offset, hint, local_hca,
+                                       attempt, by_local_hca);
+                if (eligible(id)) {
+                    selected = id;
+                    break;
+                }
+            }
+            if (selected < 0) return false;
+        }
         buffer_id = candidate;
         device_id = selected;
         return true;

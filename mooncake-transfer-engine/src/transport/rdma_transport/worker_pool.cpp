@@ -195,6 +195,27 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
         ret = RdmaTransport::selectDevice(
             peer_segment_desc, offset, length, hint, buffer_id, device_id,
             retry_count, hint_buffer_id, hint_device_id);
+        if (ret && !hint.empty()) {
+            int fallback_buffer_id = -1, fallback_device_id = -1;
+            if (RdmaTransport::selectDevice(
+                    peer_segment_desc, offset, length, fallback_buffer_id,
+                    fallback_device_id, retry_count, hint_buffer_id, -1) == 0) {
+                // Accept a fallback only when the named NIC has a zero key
+                // for this buffer, not for a malformed descriptor or range.
+                const auto &keys =
+                    peer_segment_desc->buffers[fallback_buffer_id].rkey;
+                const int named_device_id =
+                    peer_segment_desc->topology.getDeviceIndex("*", hint);
+                if (named_device_id >= 0 &&
+                    keys.size() == peer_segment_desc->devices.size() &&
+                    static_cast<size_t>(named_device_id) < keys.size() &&
+                    keys[named_device_id] == 0) {
+                    buffer_id = fallback_buffer_id;
+                    device_id = fallback_device_id;
+                    ret = 0;
+                }
+            }
+        }
     }
     if (ret) return ret;
 
@@ -202,7 +223,8 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
         static_cast<size_t>(buffer_id) >= peer_segment_desc->buffers.size() ||
         device_id < 0 ||
         static_cast<size_t>(device_id) >=
-            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+            peer_segment_desc->buffers[buffer_id].rkey.size() ||
+        peer_segment_desc->buffers[buffer_id].rkey[device_id] == 0) {
         LOG(ERROR) << "[RDMA] No rkey for MR access: seg="
                    << (peer_segment_desc ? peer_segment_desc->name : "null")
                    << " addr=" << (void *)offset << " len=" << length;
@@ -404,7 +426,9 @@ int WorkerPool::submitPostSend(
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
                 if (alt_dev_id == (size_t)device_id ||
                     alt_dev_id >=
-                        peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                        peer_segment_desc->buffers[buffer_id].rkey.size() ||
+                    peer_segment_desc->buffers[buffer_id].rkey[alt_dev_id] ==
+                        0) {
                     continue;
                 }
                 const auto &alt_path =
@@ -1067,7 +1091,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                      ++alt_dev_id) {
                     if (alt_dev_id == (size_t)device_id ||
                         alt_dev_id >=
-                            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                            peer_segment_desc->buffers[buffer_id].rkey.size() ||
+                        peer_segment_desc->buffers[buffer_id]
+                                .rkey[alt_dev_id] == 0) {
                         continue;
                     }
                     const auto &alt_path =
@@ -1169,7 +1195,9 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
             auto buffer_start = reinterpret_cast<uint64_t>(buffer.addr);
             auto buffer_end = buffer_start + buffer.length;
             if (buffer_start <= source &&
-                source + slice->length <= buffer_end) {
+                source + slice->length <= buffer_end &&
+                static_cast<size_t>(device_id) < buffer.lkey.size() &&
+                buffer.lkey[device_id] != 0) {
                 buffer_id = static_cast<int>(idx);
                 break;
             }
@@ -1450,7 +1478,8 @@ bool WorkerPool::hasAvailablePeerRailAlternative(
 
     for (size_t dev_id = 0; dev_id < peer_segment_desc->devices.size();
          ++dev_id) {
-        if (dev_id >= peer_segment_desc->buffers[buffer_id].rkey.size()) {
+        if (dev_id >= peer_segment_desc->buffers[buffer_id].rkey.size() ||
+            peer_segment_desc->buffers[buffer_id].rkey[dev_id] == 0) {
             continue;
         }
         const auto &peer_path = peer_segment_desc->internedNicPath(dev_id);
