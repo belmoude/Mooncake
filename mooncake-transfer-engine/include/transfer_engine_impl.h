@@ -143,6 +143,13 @@ class TransferEngineImpl {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
+    // Override the instance default for this registration only.
+    int registerLocalMemory(void* addr, size_t length,
+                            RdmaRegistrationPolicy policy,
+                            const std::string& location = kWildcardLocation,
+                            bool remote_accessible = true,
+                            bool update_metadata = true);
+
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
     Status submitTransfer(BatchID batch_id,
@@ -217,6 +224,11 @@ class TransferEngineImpl {
         std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
             buffer_map);
 
+    int mp_registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map,
+        RdmaRegistrationPolicy policy);
+
     int mp_unregisterLocalMemory(
         std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
             buffer_map);
@@ -275,6 +287,11 @@ class TransferEngineImpl {
 
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string& location);
+
+    int registerLocalMemoryBatch(
+        const std::vector<BufferEntry>& buffer_list,
+        RdmaRegistrationPolicy policy,
+        const std::string& location = kWildcardLocation);
 
     int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
 
@@ -434,6 +451,9 @@ class TransferEngineImpl {
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        // Snapshot the resolved policy, including when no RDMA is installed.
+        RdmaRegistrationPolicy rdma_registration_policy =
+            RdmaRegistrationPolicy::All;
     };
     void rollbackAllRegistrations(const std::vector<RegisteredRecord>& records);
 #endif
@@ -484,9 +504,14 @@ class TransferEngineImpl {
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        // Snapshot the resolved policy, including when no RDMA is installed.
+        RdmaRegistrationPolicy rdma_registration_policy =
+            RdmaRegistrationPolicy::All;
     };
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+
+    int replayLocalMemory(Transport* transport);
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 

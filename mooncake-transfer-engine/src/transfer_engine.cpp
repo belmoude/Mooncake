@@ -1910,9 +1910,7 @@ Status TransferEngine::transferScatter(
 }
 
 int TransferEngine::setRdmaRegistrationPolicy(RdmaRegistrationPolicy policy) {
-    if (policy != RdmaRegistrationPolicy::All &&
-        policy != RdmaRegistrationPolicy::TopologyLocal)
-        return ERR_INVALID_ARGUMENT;
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
     if (use_tent_) {
         if (policy == RdmaRegistrationPolicy::All) return 0;
         LOG(ERROR)
@@ -1922,4 +1920,46 @@ int TransferEngine::setRdmaRegistrationPolicy(RdmaRegistrationPolicy policy) {
     return impl_ ? impl_->setRdmaRegistrationPolicy(policy)
                  : ERR_INVALID_ARGUMENT;
 }
+
+int TransferEngine::registerLocalMemory(void* addr, size_t length,
+                                        RdmaRegistrationPolicy policy,
+                                        const std::string& location,
+                                        bool remote_accessible,
+                                        bool update_metadata) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
+    if (use_tent_) {
+        if (policy != RdmaRegistrationPolicy::All) return ERR_NOT_IMPLEMENTED;
+        return registerLocalMemory(addr, length, location, remote_accessible,
+                                   update_metadata);
+    }
+    return impl_
+               ? impl_->registerLocalMemory(addr, length, policy, location,
+                                            remote_accessible, update_metadata)
+               : ERR_INVALID_ARGUMENT;
+}
+
+int TransferEngine::registerLocalMemoryBatch(
+    const std::vector<BufferEntry>& buffer_list, RdmaRegistrationPolicy policy,
+    const std::string& location) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
+    if (use_tent_) {
+        if (policy != RdmaRegistrationPolicy::All) return ERR_NOT_IMPLEMENTED;
+        return registerLocalMemoryBatch(buffer_list, location);
+    }
+    return impl_
+               ? impl_->registerLocalMemoryBatch(buffer_list, policy, location)
+               : ERR_INVALID_ARGUMENT;
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+int TransferEngine::mp_registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>& buffer_map,
+    RdmaRegistrationPolicy policy) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_ ? impl_->mp_registerLocalMemory(buffer_map, policy)
+                 : ERR_INVALID_ARGUMENT;
+}
+#endif
+
 }  // namespace mooncake

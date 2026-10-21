@@ -175,6 +175,13 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
+    // Override the instance default for this registration only.
+    int registerLocalMemory(void* addr, size_t length,
+                            RdmaRegistrationPolicy policy,
+                            const std::string& location = kWildcardLocation,
+                            bool remote_accessible = true,
+                            bool update_metadata = true);
+
     // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr
@@ -252,6 +259,11 @@ class TransferEngine {
         std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
             buffer_map);
 
+    int mp_registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map,
+        RdmaRegistrationPolicy policy);
+
     int mp_unregisterLocalMemory(
         std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
             buffer_map);
@@ -267,6 +279,11 @@ class TransferEngine {
 
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string& location);
+
+    int registerLocalMemoryBatch(
+        const std::vector<BufferEntry>& buffer_list,
+        RdmaRegistrationPolicy policy,
+        const std::string& location = kWildcardLocation);
 
     int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
 

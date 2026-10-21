@@ -63,6 +63,11 @@ namespace mooncake {
 // Controls GPU MR placement. All retains the existing registration behavior.
 enum class RdmaRegistrationPolicy { All, TopologyLocal };
 
+constexpr bool isValidRdmaRegistrationPolicy(RdmaRegistrationPolicy policy) {
+    return policy == RdmaRegistrationPolicy::All ||
+           policy == RdmaRegistrationPolicy::TopologyLocal;
+}
+
 const static int LOCAL_SEGMENT_ID = 0;
 
 enum class HandShakeRequestType {

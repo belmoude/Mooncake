@@ -337,6 +337,17 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        default_registration_policy_);
 }
 
+int RdmaTransport::registerLocalMemory(void *addr, size_t length,
+                                       RdmaRegistrationPolicy policy,
+                                       const std::string &location,
+                                       bool remote_accessible,
+                                       bool update_metadata) {
+    if (!isValidRdmaRegistrationPolicy(policy)) return ERR_INVALID_ARGUMENT;
+    return registerLocalMemoryInternal(addr, length, location,
+                                       remote_accessible, update_metadata,
+                                       false, policy);
+}
+
 int RdmaTransport::registerLocalMemoryInternal(
     void *addr, size_t length, const std::string &name, bool remote_accessible,
     bool update_metadata, bool force_sequential,
@@ -875,7 +886,15 @@ int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-    const auto effective_policy = default_registration_policy_;
+    return registerLocalMemoryBatch(buffer_list, default_registration_policy_,
+                                    location);
+}
+
+int RdmaTransport::registerLocalMemoryBatch(
+    const std::vector<RdmaTransport::BufferEntry> &buffer_list,
+    RdmaRegistrationPolicy effective_policy, const std::string &location) {
+    if (!isValidRdmaRegistrationPolicy(effective_policy))
+        return ERR_INVALID_ARGUMENT;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     if (!globalConfig().with_nvidia_peermem) {
         for (auto &buffer : buffer_list) {

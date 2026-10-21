@@ -76,10 +76,19 @@ class RdmaTransport : public Transport {
                             const std::string &location, bool remote_accessible,
                             bool update_metadata) override;
 
+    int registerLocalMemory(void *addr, size_t length,
+                            RdmaRegistrationPolicy policy,
+                            const std::string &location, bool remote_accessible,
+                            bool update_metadata);
+
     int unregisterLocalMemory(void *addr, bool update_metadata = true) override;
 
     int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
                                  const std::string &location) override;
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
+                                 RdmaRegistrationPolicy policy,
+                                 const std::string &location);
 
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
